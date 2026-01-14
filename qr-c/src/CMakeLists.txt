@@ -16,7 +16,6 @@ FetchContent_MakeAvailable(Crow)
 
 option(ENABLE_UNIT_TEST "Enable unit tests" OFF)
 
-# Um único executável
 add_executable(qr_c
   main.cpp
   core/Core.cpp
@@ -24,11 +23,7 @@ add_executable(qr_c
   adapters/rest/RestServer.cpp
 )
 
-# Link com Crow + suas libs (se estiverem definidas em outro lugar)
 target_link_libraries(qr_c PRIVATE Crow::Crow)
-
-# Se você realmente usa essas libs e elas existem, descomente:
-# target_link_libraries(qr_c PRIVATE ${LIBRARY_MODELS} ${LIBRARY_CONTROLLER})
 
 if(ENABLE_UNIT_TEST)
   enable_testing()
