@@ -1,101 +1,238 @@
-# Design Decisions & Rationale — Serial Emulation Between Docker Containers (Fake QR Reader)
+# Serial Emulation + Command Dispatcher (Fake QR Reader) — Architecture Notes
 
-## Context / Goal
-We need a reliable way to emulate a QR-code reader that communicates over a “serial-like” interface, while keeping the system containerized (Docker Compose). The consumer (C++ application in `qr-c`) expects to open a serial device path (e.g., `/dev/tty*` or equivalent) and read data as a stream.
+This document describes the architecture and operational constraints of the **Fake QR Reader serial emulation** and the **single-threaded command dispatcher** used in this project.
 
-## Problem Statement (Why the naive PTY sharing fails)
-A common first attempt is to create a PTY pair in one container (e.g., `fake-serial`) using `socat pty,...` and expose the resulting symlink(s) (e.g., `/tmp/ttyS1`) via a shared volume (`/tmp`).
+It is intended to be referenced from the main `README.md` (or placed under `docs/`), and to help with:
+- onboarding and troubleshooting,
+- understanding why PTY sharing across containers fails,
+- extending the system (real serial, more protocols, concurrency, CI).
 
-This does **not** work reliably in Docker because:
+---
 
-- `socat pty` creates PTYs under `devpts` (e.g., `/dev/pts/N`).
-- Each container has its own `devpts` instance (its own `/dev/pts` namespace).
+## Scope
+
+This document covers **two tightly related concerns**:
+
+1. **Serial Emulation between Docker containers**
+   - How a “serial-like device path” is presented to the consumer container.
+   - Why PTY sharing via volumes does not work in Docker.
+
+2. **Hexagonal architecture + single-threaded dispatcher**
+   - How REST and Serial inputs safely drive the same stateful domain core.
+
+---
+
+## Component Overview
+
+### Services (logical)
+
+- **fake-serial**  
+  A simulator that emits QR payloads (or protocol frames) as a byte stream over TCP.
+
+- **qr-c**  
+  The consumer container that runs:
+  - a **local PTY** (created inside this container),
+  - a **bridge** (`socat`) between TCP and PTY,
+  - the **C++ application** which opens the PTY path (e.g., `/tmp/ttyS1`) and reads it like a serial stream.
+
+---
+
+## Why “PTY sharing via volume” fails
+
+A naive design creates a PTY in `fake-serial` and shares `/tmp/ttyS1` via a volume. This fails due to Linux namespaces:
+
+- `socat pty` creates PTYs under `devpts` (`/dev/pts/N`).
+- Each container has its own `devpts` instance (namespaced `/dev/pts`).
 - The `link=/tmp/ttyS1` is only a **symlink** to `/dev/pts/N` *inside the container that created it*.
-- Mounting `/tmp` between containers shares the symlink, **not** the underlying PTY device.  
-  The consumer container sees a link like `/tmp/ttyS1 -> /dev/pts/3`, but `/dev/pts/3` does not exist in its own namespace.
-- Trying to “force” sharing `/dev/pts` and `/dev/ptmx` across containers (bind-mount) is fragile and can break container startup (e.g., `ptmx: device or resource busy`) because the runtime (runc) manages those devices during container init.
+- Sharing `/tmp` shares the symlink text, not the underlying PTY device node.
+- Bind-mounting `/dev/pts` and `/dev/ptmx` across containers is fragile and can break container startup.
 
-**Conclusion:** PTY devices are not a portable/shared resource across containers. Sharing a PTY via a volume is fundamentally incompatible with Docker’s isolation model.
+**Conclusion:** A PTY device is not a portable/shared resource across containers. The PTY must exist in the same container where the application opens it.
 
-## Selected Approach (Why we chose it)
-We selected a Docker-native design:
+---
 
-- `fake-serial` exposes the QR reader stream over the Docker network (TCP).
-- `qr-c` creates the local “serial device” (PTY) and bridges it to the TCP stream using `socat`.
+## Selected Design
 
-This means the device file that the C++ application opens exists **in the same container namespace** where the application runs, which is the only robust way to make “serial-by-path” work in containers.
+### Decision
+Treat “serial” as a **byte-stream transport problem**, not a shared device problem.
 
-### Data flow
-(fake-serial) TCP server ---> (qr-c) socat bridge: TCP <-> PTY ---> C++ app reads /tmp/ttyS1
+- Container-to-container transport uses **TCP** (Docker-native).
+- The consumer container creates the local serial endpoint as a **PTY**.
+- `socat` bridges the TCP stream to that PTY.
 
+### Runtime Data Flow
 
-## Key Design Decisions
-### Decision 1 — Treat “serial” as a stream transport problem, not a shared device problem
-Instead of trying to share a kernel TTY device across containers (which Docker is not designed for), we carry the bytes over a standard container-friendly transport: TCP.
+```mermaid
+flowchart LR
+  subgraph Fake["fake-serial container"]
+    F[TCP server\n(emits QR stream)]
+  end
 
-**Rationale:**
-- TCP is natively supported across containers with predictable behavior.
-- Easy to instrument (logging, delays, fault injection).
-- Works in CI and across developer machines without host-level privileges.
+  subgraph C["qr-c container"]
+    S[socat bridge\nTCP <-> PTY]
+    P["PTY device\n/tmp/ttyS1"]
+    A["C++ app\nopens /tmp/ttyS1"]
+  end
 
-### Decision 2 — Create the PTY in the consumer container (`qr-c`)
-The consumer container is where the serial device path is required. Therefore the PTY must be created there.
+  F -- TCP:7000 --> S
+  S -- local PTY --> P
+  A -- read bytes --> P
+```
 
-**Rationale:**
-- The C++ application uses OS calls that expect a local device node.
-- Ensures the application sees a valid TTY (termios-compatible) inside its own namespace.
-- Avoids devpts namespace mismatch entirely.
+---
 
-### Decision 3 — Use `socat` as the bridge (PTY <-> TCP)
-`socat` is a lightweight, widely available tool for connecting file descriptors, PTYs, and sockets.
+## Hexagonal Architecture + Single-threaded Command Dispatcher
 
-**Rationale:**
-- Minimal moving parts and no custom code required for the bridge.
-- Well-known behavior for raw/echo settings.
-- Easy to run as a background process in an entrypoint shell.
+### Rationale
+The system has multiple concurrent inputs (REST + Serial) that must drive the same stateful behavior reliably.
 
-## Alternatives Considered
-### Alternative A — Host virtual TTY pairs + `devices:` in Compose (Option B)
-Create `/dev/tnt0` and `/dev/tnt1` on the host (e.g., using `tty0tty`) and pass each endpoint into a different container.
+We use:
+- **Ports & Adapters (Hexagonal)** for clean boundaries.
+- A **single-threaded Dispatcher** to serialize domain execution.
 
-**Why not selected:**
-- Requires host kernel module installation/configuration.
-- Often blocked by Secure Boot (“Key was rejected by service”).
-- Reduces portability (developers/CI runners must be prepared identically).
-- Adds operational/security friction (permissions, udev rules, privileged access).
+Benefits:
+- deterministic ordering of state transitions,
+- no mutexes in the domain core (core is called only by the dispatcher thread),
+- simpler tests (core is pure logic).
 
-### Alternative B — Bind-mount `/dev/pts` and `/dev/ptmx` between containers
-Attempt to share PTYs by mounting host `/dev/pts` into containers.
+### Component Interaction
 
-**Why not selected:**
-- Fragile with Docker/runc initialization; can fail with `ptmx busy` and other runtime errors.
-- Higher privilege surface area and unpredictable across host configurations.
-- Not a maintainable architecture for teams/CI.
+```mermaid
+flowchart TB
+  subgraph Adapters["Adapters"]
+    R[REST Adapter\n(Crow)]
+    S[Serial Adapter\n(termios, reconnect)]
+  end
 
-### Alternative C — Run fake device and consumer in the same container
-Put both `fake-serial` and `qr-c` in one container so PTY is naturally local.
+  D[Dispatcher\n(single execution thread)]
+  C[Core\n(StateMachine + CommandHandler)]
+  JR[JobRunner\n(background job)]
+  JS[JobStore\n(in-memory results)]
 
-**Why not selected:**
-- Reduces modularity (simulator no longer isolated).
-- Harder to reuse fake device across multiple consumers.
-- Less representative of a real multi-service environment.
+  R --> D
+  S --> D
+  D --> C
+  C --> D
 
-## Benefits of the Selected Approach
-- **Portability:** Runs on any host with Docker; no kernel modules or Secure Boot changes.
-- **Reproducibility:** Stable behavior across dev machines and CI.
-- **Isolation:** Fake device stays isolated; consumer remains independent.
-- **Observability & Testing:** TCP stream is easy to log, throttle, delay, disconnect/reconnect for robustness testing.
-- **Low Operational Risk:** Avoids privileged containers and host-level device dependencies.
+  D --> JR
+  JR --> JS
+  R --> JS
+```
+
+> Note: the exact wiring depends on which commands are synchronous vs. asynchronous (e.g., `/start` spawns a job and `/result/{id}` polls JobStore).
+
+---
+
+## Compose-level Implementation (reference)
+
+Typical pattern:
+
+- `fake-serial` runs a TCP server on port `7000`.
+- `qr-c` starts a `socat` bridge that creates `/tmp/ttyS1` locally and forwards bytes from `fake-serial:7000`.
+
+Example bridge command (inside `qr-c` container):
+
+```sh
+socat pty,raw,echo=0,link=/tmp/ttyS1 tcp:fake-serial:7000
+```
+
+---
+
+## Operational Notes
+
+### Environment variables (recommended)
+Use environment variables to keep configuration stable and CI-friendly:
+
+- `SERIAL_PORT=/tmp/ttyS1`  
+  Path opened by the C++ app.
+
+- `FAKE_SERIAL_HOST=fake-serial`  
+  Docker service name.
+
+- `FAKE_SERIAL_PORT=7000`  
+  TCP port exposed by fake-serial.
+
+- `REST_BIND=0.0.0.0`
+- `REST_PORT=8080`
+- `READ_TIMEOUT_MS=3000`
+
+---
 
 ## Known Limitations / Trade-offs
-- The “serial device file” is local to the consumer container (by design).  
-  The fake device is a stream provider, not a shared kernel TTY.
-- If strict hardware parity is required (real `/dev/ttyUSB*` semantics, line discipline specifics), host-level device approaches may be closer—but at significant portability cost.
 
-## Implementation Summary (Compose-level)
-- `fake-serial`: TCP server emitting QR strings (or protocol frames).
-- `qr-c`: `socat pty,raw,echo=0,link=/tmp/ttyS1 tcp:fake-serial:7000`
-- C++ app: opens `/tmp/ttyS1` and reads from it like a serial stream.
+1. **PTY exists only inside the consumer container**
+   - By design, `/tmp/ttyS1` is local to `qr-c`.
 
-## Outcome
-This approach resolves the fundamental Docker namespace constraints (devpts isolation) while still presenting a true serial-like device path to the C++ consumer. It is therefore the most robust and maintainable solution for container-based development and automated testing.
+2. **Not perfect parity with real USB serial devices**
+   - Some `/dev/ttyUSB*` line-discipline quirks will not be reproduced exactly.
+
+3. **JobStore is in-memory**
+   - Results are lost when the container restarts (no persistence).
+
+4. **Single job policy (current JobRunner design)**
+   - Only one job at a time; starting a new job stops the previous one.
+
+5. **Backpressure not yet explicit**
+   - Dispatcher queue is unbounded in the current sample; production should define queue limits and behavior on overload.
+
+---
+
+## Troubleshooting (common failures)
+
+- **`/tmp/ttyS1` exists but app cannot open it**
+  - Ensure `socat` is running in the same container as the app.
+  - Ensure file permissions allow read/write inside the container.
+
+- **`/tmp/ttyS1 -> /dev/pts/N` points to a missing PTY**
+  - This typically happens when the PTY was created in a different container. Create PTY in the consumer container.
+
+- **Container startup fails when mounting `/dev/pts` or `/dev/ptmx`**
+  - Remove those mounts; rely on TCP transport + local PTY.
+
+---
+
+## Future Improvements
+
+### Serial / Transport
+- Add **framing/protocol** support (e.g., newline-delimited, STX/ETX, checksum).
+- Add **fault injection** knobs in fake-serial (drop, delay, jitter, disconnect).
+- Add **reconnect/backoff** logic in the SerialAdapter.
+
+### Dispatcher / Domain
+- Add **queue capacity** + overflow policy (reject with `BUSY`, drop, or block with timeout).
+- Add **metrics** (queue depth, command latency, job duration).
+- Add **structured error taxonomy** (stable error codes + mapping to HTTP).
+
+### Jobs
+- Support **multiple concurrent jobs** (map id -> worker) or a job pool.
+- Persist JobStore (Redis / SQLite) if job results must survive restarts.
+- Make job results richer (timestamps, duration, error details, raw frames).
+
+### Observability
+- Add request/response logging with correlation IDs (jobId).
+- Export Prometheus metrics (optional).
+
+### CI / Code Standards
+- Run `format-check` in CI (clang-format).
+- Add optional `clang-tidy` gate for PRs (using `compile_commands.json`).
+
+---
+
+## Where to place diagrams
+
+If you already have a general architecture diagram under `/diagrams`, add two small diagrams here (or reference them from the general diagram):
+
+- `diagrams/serial-emulation-dataflow.(png|svg)`  
+  PTY-in-consumer + TCP bridge flow.
+
+- `diagrams/ports-adapters-dispatcher.(png|svg)`  
+  Hexagonal architecture boundaries + dispatcher.
+
+---
+
+## Suggested README.md integration
+
+In the main `README.md`, add a short section like:
+
+> **Architecture note:** See `docs/serial-emulation-and-dispatcher.md` for design rationale, limitations, and extension points.
+
