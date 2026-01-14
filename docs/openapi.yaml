@@ -1,0 +1,415 @@
+openapi: 3.0.3
+info:
+  title: QR-C Serial Service API
+  version: "1.0.0"
+  description: >
+    REST API for controlling the QR-C service (Container A). Commands are sent via REST and
+    the service interacts with a local serial/PTY device defined by env vars (SERIAL_PORT, BAUDRATE, ...).
+    START waits for a QR read until timeout (READ_TIMEOUT_MS). For robustness, START is provided
+    as an async job: POST /start -> 202 + jobId; GET /result/{id} -> DONE|TIMEOUT.
+
+servers:
+  - url: http://localhost:8080
+
+tags:
+  - name: Health
+  - name: Status
+  - name: Commands
+  - name: Jobs
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  value:
+                    ok: true
+                    message: UP
+
+  /status:
+    get:
+      tags: [Status]
+      summary: Get current service status
+      operationId: getStatus
+      responses:
+        "200":
+          description: Current state and runtime information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              examples:
+                minimal:
+                  value:
+                    ok: true
+                    state: NOT_INIT
+                extended_optional:
+                  value:
+                    ok: true
+                    state: INIT
+                    serial:
+                      port: /tmp/ttyS1
+                      baudrate: 115200
+                      connected: true
+                      reopen_count: 0
+                      last_error: ""
+                    config:
+                      mode: passive
+                      read_timeout_ms: 3000
+                      reopen_delay_ms: 1000
+                    last_result:
+                      status: NONE
+                      message: ""
+                      data: {}
+
+  /command:
+    post:
+      tags: [Commands]
+      summary: Execute a command (synchronous)
+      description: >
+        Execute a command synchronously.
+        Supported commands: PING, INIT, STOP.
+        START is executed via the async job API: POST /start and GET /result/{id}.
+      operationId: postCommand
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommandRequest"
+            examples:
+              ping:
+                value: { command: "PING" }
+              init:
+                value: { command: "INIT" }
+              stop:
+                value: { command: "STOP" }
+      responses:
+        "200":
+          description: Command executed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+              examples:
+                pong:
+                  value:
+                    ok: true
+                    command: "PING"
+                    state: "INIT"
+                    message: "PONG"
+                    data: {}
+                init_ok:
+                  value:
+                    ok: true
+                    command: "INIT"
+                    state: "INIT"
+                    message: "OK"
+                    data: {}
+                stop_ok:
+                  value:
+                    ok: true
+                    command: "STOP"
+                    state: "STOPPED"
+                    message: "OK"
+                    data: {}
+        "400":
+          description: Invalid request (bad JSON / missing fields / unknown command)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                bad_request:
+                  value: { ok: false, message: "ERR:BAD_REQUEST" }
+                unknown:
+                  value: { ok: false, message: "ERR:UNKNOWN_CMD" }
+                use_start_endpoint:
+                  value: { ok: false, message: "ERR:USE_START_ENDPOINT" }
+        "503":
+          description: Service busy (dispatcher timeout / overload)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                busy:
+                  value: { ok: false, message: "ERR:BUSY" }
+
+  /start:
+    post:
+      tags: [Jobs]
+      summary: Start a QR read job (async START)
+      description: >
+        Recommended way to execute START. The service waits up to READ_TIMEOUT_MS (or request override)
+        for a QR read. It returns immediately with 202 + jobId. Poll GET /result/{id} for DONE|TIMEOUT.
+      operationId: startJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartRequest"
+            examples:
+              default:
+                value: {}
+              override_timeout:
+                value: { timeout_ms: 3000 }
+      responses:
+        "202":
+          description: Job accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartResponse"
+              examples:
+                accepted:
+                  value:
+                    ok: true
+                    jobId: "a1b2c3d4"
+                    state: "RUNNING"
+                    message: "ACCEPTED"
+        "409":
+          description: START not allowed in current state (e.g., NOT_INIT)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                not_init:
+                  value: { ok: false, message: "ERR:NOT_INIT" }
+        "400":
+          description: Invalid request body (wrong type / invalid fields)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                bad_request:
+                  value: { ok: false, message: "ERR:BAD_REQUEST" }
+        "503":
+          description: Service busy (queue full / cannot accept job)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                busy:
+                  value: { ok: false, message: "ERR:BUSY" }
+
+  /result/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get job result
+      operationId: getJobResult
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Job identifier returned by POST /start
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultResponse"
+              examples:
+                pending:
+                  value:
+                    ok: true
+                    jobId: "a1b2c3d4"
+                    status: "PENDING"
+                    state: "RUNNING"
+                    message: "PENDING"
+                    data: {}
+                done:
+                  value:
+                    ok: true
+                    jobId: "a1b2c3d4"
+                    status: "DONE"
+                    state: "RUNNING"
+                    message: "OK"
+                    data:
+                      qr: "QR:2026-01-14 18:12:00:PID=123"
+                timeout:
+                  value:
+                    ok: true
+                    jobId: "a1b2c3d4"
+                    status: "TIMEOUT"
+                    state: "RUNNING"
+                    message: "TIMEOUT"
+                    data: {}
+        "404":
+          description: Unknown jobId
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                not_found:
+                  value: { ok: false, message: "ERR:NOT_FOUND" }
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [ok, message]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+
+    CommandRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+          description: Command name
+          enum: ["PING", "INIT", "STOP"]
+        params:
+          type: object
+          description: Optional command parameters (implementation-defined)
+          additionalProperties: true
+          properties:
+            timeout_ms:
+              type: integer
+              minimum: 1
+              description: Optional override for START timeout (unused when START is not supported here)
+
+    CommandResponse:
+      type: object
+      required: [ok, command, state, message, data]
+      properties:
+        ok:
+          type: boolean
+        command:
+          type: string
+        state:
+          type: string
+          enum: ["NOT_INIT", "INIT", "RUNNING", "STOPPED"]
+        message:
+          type: string
+          description: Human-readable status (OK, PONG, TIMEOUT, ERR:...)
+        data:
+          type: object
+          additionalProperties: true
+
+    ErrorResponse:
+      type: object
+      required: [ok, message]
+      properties:
+        ok:
+          type: boolean
+          example: false
+        message:
+          type: string
+
+    StatusResponse:
+      type: object
+      required: [ok, state]
+      properties:
+        ok:
+          type: boolean
+        state:
+          type: string
+          enum: ["NOT_INIT", "INIT", "RUNNING", "STOPPED"]
+        serial:
+          type: object
+          required: [port, baudrate, connected, reopen_count, last_error]
+          properties:
+            port:
+              type: string
+            baudrate:
+              type: integer
+            connected:
+              type: boolean
+            reopen_count:
+              type: integer
+              minimum: 0
+            last_error:
+              type: string
+        config:
+          type: object
+          required: [mode, read_timeout_ms, reopen_delay_ms]
+          properties:
+            mode:
+              type: string
+              enum: ["generate", "passive"]
+            read_timeout_ms:
+              type: integer
+              minimum: 1
+            reopen_delay_ms:
+              type: integer
+              minimum: 1
+        last_result:
+          type: object
+          required: [status, message, data]
+          properties:
+            status:
+              type: string
+              enum: ["NONE", "PENDING", "DONE", "TIMEOUT"]
+            message:
+              type: string
+            data:
+              type: object
+              additionalProperties: true
+
+    StartRequest:
+      type: object
+      description: Optional overrides for START job
+      properties:
+        timeout_ms:
+          type: integer
+          minimum: 1
+          description: Optional override for READ_TIMEOUT_MS
+
+    StartResponse:
+      type: object
+      required: [ok, jobId, state, message]
+      properties:
+        ok:
+          type: boolean
+        jobId:
+          type: string
+        state:
+          type: string
+          enum: ["NOT_INIT", "INIT", "RUNNING", "STOPPED"]
+        message:
+          type: string
+          enum: ["ACCEPTED"]
+
+    ResultResponse:
+      type: object
+      required: [ok, jobId, status, state, message, data]
+      properties:
+        ok:
+          type: boolean
+        jobId:
+          type: string
+        status:
+          type: string
+          enum: ["PENDING", "DONE", "TIMEOUT"]
+        state:
+          type: string
+          enum: ["NOT_INIT", "INIT", "RUNNING", "STOPPED"]
+        message:
+          type: string
+        data:
+          type: object
+          additionalProperties: true
+          
