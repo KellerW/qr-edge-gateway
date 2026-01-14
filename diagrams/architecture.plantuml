@@ -1,0 +1,60 @@
+@startuml
+' ----------------- Look & feel enterprise -----------------
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "Arial"
+
+skinparam rectangle {
+  RoundCorner 8
+  BorderColor #555555
+  BackgroundColor #F5F5F5
+}
+
+skinparam node {
+  BorderColor #555555
+  BackgroundColor #FFFFFF
+}
+
+skinparam cloud {
+  BackgroundColor #FFFFFF
+  BorderColor #555555
+}
+
+top to bottom direction
+
+<style>
+component {
+  HorizontalAlignment center
+  Padding 8
+}
+</style>
+
+' ----------------- Cloud MQTT broker -----------------
+cloud "Cloud MQTT Broker\n(test.mosquitto.org)\nMQTT/TLS 1.2 : 8883" as Cloud
+
+' ----------------- Edge host + Docker network -----------------
+node "Edge Device / Docker Host" as Host {
+
+  node "Docker internal network (bridge)" as DockerNet {
+
+    component "<b>Container B</b>\n«MQTT gateway»\n gateway-module (Python)" as B
+
+    component "<b>Container A</b>\n«QR device adapter»\n qr-code-module (C++)\n cmds: INIT, PING, START, STOP" as A
+  }
+
+  node "Serial QR Device\n/dev/ttyUSB0" as Serial
+}
+
+' ----------------- MQTT between cloud and gateway -----------------
+Cloud -down-> B : from_cloud/commands\nMQTT/TLS 1.2 : 8883
+B -up-> Cloud : from_device/events\nMQTT/TLS 1.2 : 8883
+
+' ----------------- REST API between containers -----------------
+B -down-> A : REST/HTTP 1.1 POST\n/qr/{init|ping|start|stop}
+A -up-> B : REST/HTTP 1.1 200 OK\nJSON payload
+
+' ----------------- Serial link between Container A and device -----------------
+A -down-> Serial : UART 115200 8N1
+Serial -up-> A : QR payload
+
+@enduml
