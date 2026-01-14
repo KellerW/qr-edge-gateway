@@ -1,27 +1,24 @@
 services:
   fake-serial:
     image: alpine:3.19
-    container_name: fake-serial
     command: >
-      sh -c '
+      sh -lc '
         apk add --no-cache socat busybox-extras &&
         echo "[fake-serial] TCP server on :7000" &&
-        while true; do
-          { while true; do printf "QR:%s\n" "123456"; sleep 2; done; } |
-          socat - TCP-LISTEN:7000,reuseaddr,fork;
-        done
+        { while true; do printf "QR:%s\n" "123456"; sleep 2; done; } |
+        socat - TCP-LISTEN:7000,reuseaddr,fork
       '
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 7000"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 2s
 
   qr-c:
     build:
       context: ./qr-c
       dockerfile: Dockerfile
-    container_name: qr-c
     environment:
       SERIAL_PORT: /tmp/ttyS1
       LOG_PATH: /var/log/qr-c/qr-c.log
@@ -37,12 +34,15 @@ services:
       fake-serial:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "test -e /tmp/ttyS1"]
+      # Prefer checking the REST endpoint (service readiness) over file existence.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health | grep -q '\"ok\":true'"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
 
   api-test:
+    profiles: ["test"]
     build:
       context: ./tests
       dockerfile: Dockerfile
@@ -54,20 +54,20 @@ services:
       TIMEOUT_MS: 1000
       POLL_INTERVAL: 0.3
       POLL_MAX_SECONDS: 6.0
+
   contract-test:
     profiles: ["test"]
     build:
       context: ./tests/contract
       dockerfile: Dockerfile
-    container_name: contract-test
     depends_on:
       qr-c:
         condition: service_healthy
     volumes:
       - ./docs:/spec:ro
+
   gateway-py:
     image: python:3.12-slim
-    container_name: gateway-py
     working_dir: /app
     environment:
       MQTT_HOST: test.mosquitto.org
@@ -76,11 +76,12 @@ services:
       MQTT_TOPIC_CMD: from_cloud/commands
       MQTT_TOPIC_EVENT: from_device/events
       LOG_PATH: /var/log/gateway-py/gateway.log
+      QR_API_BASE_URL: http://qr-c:8080
     command: >
-      sh -c '
-        echo "[gateway-py] up (placeholder) MQTT_HOST=$$MQTT_HOST" &&
+      sh -lc '
+        echo "[gateway-py] up (placeholder) MQTT_HOST=$MQTT_HOST" &&
         mkdir -p /var/log/gateway-py &&
-        touch $$LOG_PATH &&
+        touch "$LOG_PATH" &&
         sleep infinity
       '
     volumes:
