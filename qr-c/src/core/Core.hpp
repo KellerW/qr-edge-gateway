@@ -73,6 +73,8 @@ class Core
      */
     State state() const { return st_; }
 
+    Response finish_job(); // RUNNING -> INIT (when allowed)
+
   private:
     /**
      * @brief Converts a string to uppercase.

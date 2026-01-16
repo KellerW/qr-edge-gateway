@@ -1,6 +1,6 @@
 /**
  * @file Core.cpp
- * @brief Implementation of core::Core command handling and simple state transitions.
+ * @brief Implementation of core::Core command handling and guarded state transitions.
  *
  * The Core component encapsulates the application state machine and provides:
  * - basic command normalization (upper-casing),
@@ -12,6 +12,15 @@
  * - Commands are case-insensitive due to normalization (upper()).
  * - START is intentionally rejected in handle_sync_command(); clients should use
  *   the asynchronous start endpoint (e.g., REST /start), which calls start_job().
+ *
+ * Guarded lifecycle:
+ * - NOT_INIT -> INIT -> RUNNING -> STOPPED
+ * - INIT is also allowed from STOPPED (re-init).
+ * - INIT is rejected while RUNNING (409 ERR:BUSY).
+ * - start_job is allowed only from INIT:
+ *     - NOT_INIT  -> 409 ERR:NOT_INIT
+ *     - RUNNING   -> 409 ERR:ALREADY_RUNNING
+ *     - STOPPED   -> 409 ERR:STOPPED
  */
 
 #include "Core.hpp"
@@ -21,15 +30,6 @@
 namespace core
 {
 
-/**
- * @brief Converts a string to uppercase using C locale semantics.
- *
- * The conversion uses std::toupper and casts through unsigned char to avoid
- * undefined behavior for negative char values.
- *
- * @param s Input string.
- * @return std::string Uppercased copy of @p s.
- */
 std::string Core::upper(std::string s)
 {
     for (char& c : s)
@@ -37,20 +37,6 @@ std::string Core::upper(std::string s)
     return s;
 }
 
-/**
- * @brief Handles a synchronous command and returns a Response.
- *
- * Supported commands (case-insensitive):
- * - PING: returns message "PONG"
- * - INIT: transitions state to INIT and returns "OK"
- * - STOP: transitions state to STOPPED via stop()
- * - START: rejected (400) with "ERR:USE_START_ENDPOINT" (prefer async flow)
- *
- * Unknown commands return 400 "ERR:UNKNOWN_CMD".
- *
- * @param cmd Command string to execute.
- * @return Response Result of command execution including state and message.
- */
 Response Core::handle_sync_command(const std::string& cmd)
 {
     Response r;
@@ -62,20 +48,33 @@ Response Core::handle_sync_command(const std::string& cmd)
         r.message = "PONG";
         return r;
     }
+
     if (r.command == "INIT")
     {
+        // Do not allow re-initialization while RUNNING.
+        if (st_ == State::RUNNING)
+        {
+            r.ok = false;
+            r.http_status = 409;
+            r.message = "ERR:BUSY";
+            return r;
+        }
+
+        // Allow INIT from NOT_INIT or STOPPED; idempotent if already INIT.
         st_ = State::INIT;
         r.state = st_;
         r.message = "OK";
         return r;
     }
+
     if (r.command == "STOP")
     {
         return stop();
     }
+
     if (r.command == "START")
     {
-        // Optional: synchronous START is intentionally not supported here.
+        // Synchronous START is intentionally not supported here.
         r.ok = false;
         r.http_status = 400;
         r.message = "ERR:USE_START_ENDPOINT";
@@ -88,19 +87,6 @@ Response Core::handle_sync_command(const std::string& cmd)
     return r;
 }
 
-/**
- * @brief Starts an asynchronous job by transitioning the state machine.
- *
- * This method is intended to be called by an async orchestration layer
- * (e.g., Dispatcher + REST /start), not directly as a synchronous command.
- *
- * Behavior:
- * - If the core is not initialized (State::NOT_INIT), returns 409 "ERR:NOT_INIT".
- * - Otherwise transitions to State::RUNNING and returns 202 "ACCEPTED".
- *
- * @param timeout_ms Job timeout in milliseconds (currently unused by Core).
- * @return Response Result of the job-start attempt.
- */
 Response Core::start_job(int /*timeout_ms*/)
 {
     Response r;
@@ -115,6 +101,23 @@ Response Core::start_job(int /*timeout_ms*/)
         return r;
     }
 
+    if (st_ == State::RUNNING)
+    {
+        r.ok = false;
+        r.http_status = 409;
+        r.message = "ERR:ALREADY_RUNNING";
+        return r;
+    }
+
+    if (st_ == State::STOPPED)
+    {
+        r.ok = false;
+        r.http_status = 409;
+        r.message = "ERR:STOPPED";
+        return r;
+    }
+
+    // Only INIT reaches here.
     st_ = State::RUNNING;
     r.state = st_;
     r.message = "ACCEPTED";
@@ -122,11 +125,6 @@ Response Core::start_job(int /*timeout_ms*/)
     return r;
 }
 
-/**
- * @brief Stops the core and transitions to State::STOPPED.
- *
- * @return Response Result of the stop operation.
- */
 Response Core::stop()
 {
     Response r;
@@ -136,5 +134,36 @@ Response Core::stop()
     r.message = "OK";
     return r;
 }
+
+Response Core::finish_job()
+{
+    Response r;
+    r.command = "FINISH";
+    r.state = st_;
+
+    if (st_ == State::NOT_INIT)
+    {
+        r.ok = false;
+        r.http_status = 409;
+        r.message = "ERR:NOT_INIT";
+        return r;
+    }
+    if (st_ == State::STOPPED)
+    {
+        r.ok = false;
+        r.http_status = 409;
+        r.message = "ERR:STOPPED";
+        return r;
+    }
+    if (st_ == State::RUNNING)
+    {
+        st_ = State::INIT;
+    }
+
+    r.state = st_;
+    r.message = "OK";
+    return r;
+}
+
 
 } // namespace core

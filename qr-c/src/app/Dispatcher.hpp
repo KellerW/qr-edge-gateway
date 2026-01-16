@@ -59,7 +59,10 @@ struct Task
         START_JOB,
 
         /// Request a stop via core::Core::stop().
-        STOP
+        STOP,
+
+        FINISH_JOB
+
     };
 
     /// Task kind (defaults to SYNC_COMMAND).
@@ -158,6 +161,15 @@ class Dispatcher
         return fut;
     }
 
+    std::future<core::Response> submit_finish_job()
+    {
+        Task t;
+        t.kind = Task::Kind::FINISH_JOB;
+        auto fut = t.prom.get_future();
+        push(std::move(t));
+        return fut;
+    }
+
     /**
      * @brief Stops the dispatcher and joins the worker thread.
      *
@@ -229,6 +241,10 @@ class Dispatcher
                 else if (t.kind == Task::Kind::START_JOB)
                 {
                     r = core_.start_job(t.timeout_ms);
+                }
+                else if (t.kind == Task::Kind::FINISH_JOB)
+                {
+                    r = core_.finish_job();
                 }
                 else
                 {

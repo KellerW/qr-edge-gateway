@@ -13,17 +13,22 @@ services:
       timeout: 3s
       retries: 10
       start_period: 2s
+
   qr-c:
     build:
       context: ./qr-c
       dockerfile: Dockerfile
     environment:
       SERIAL_PORT: /tmp/ttyS1
-      #LOG_PATH: /var/log/qr-c/qr-c.log
       FAKE_SERIAL_HOST: fake-serial
       FAKE_SERIAL_PORT: 7000
       REST_BIND: 0.0.0.0
       REST_PORT: 8080
+      # Se o seu entrypoint ainda usa LOG_PATH, descomente:
+      # LOG_PATH: /var/log/qr-c/qr-c.log
+      # Se você usa o novo logging:
+      # LOG_LEVEL: info
+      # LOG_FILE: ""   # stdout only
     ports:
       - "8080:8080"
     volumes:
@@ -32,7 +37,6 @@ services:
       fake-serial:
         condition: service_healthy
     healthcheck:
-      # Prefer checking the REST endpoint (service readiness) over file existence.
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health | grep -q '\"ok\":true'"]
       interval: 5s
       timeout: 3s

@@ -2,36 +2,28 @@
  * @file RestServer.cpp
  * @brief REST API adapter implemented with Crow.
  *
- * This module exposes HTTP endpoints that wrap the application core and job subsystem:
- * - Health probing
- * - Core state reporting
- * - Synchronous command dispatch
- * - Asynchronous job start + result polling
- *
- * All responses are JSON with `Content-Type: application/json`.
- *
  * Endpoints:
  * - GET  /health                -> { ok, message }
  * - GET  /status                -> { ok, state }
  * - POST /command               -> { ok, command, state, message, data:{ qr?, jobId? } }
  * - POST /start                 -> { ok, jobId, state, message } (202 Accepted)
  * - GET  /result/{jobId}        -> { ok, jobId, status, state, message, data:{ qr? } }
+ * - POST /stop                  -> { ok, state, message } (cancels running job + stops core)
  */
 
 #include "RestServer.hpp"
 
 #include <chrono>
+#include <cctype>
+#include <exception>
+#include <future>
+#include <string>
+
+#include <spdlog/spdlog.h>
 
 namespace adapters::rest
 {
 
-/**
- * @brief Converts an app::JobStatus enum to a stable string for JSON output.
- *
- * @param s Job status value.
- * @return std::string A stable, upper-case status string ("PENDING", "DONE", "TIMEOUT"),
- *         or "UNKNOWN" if the enum value is not recognized.
- */
 static std::string job_status_to_string(app::JobStatus s)
 {
     switch (s)
@@ -42,21 +34,12 @@ static std::string job_status_to_string(app::JobStatus s)
         return "DONE";
     case app::JobStatus::TIMEOUT:
         return "TIMEOUT";
+    case app::JobStatus::CANCELLED:
+        return "CANCELLED";
     }
     return "UNKNOWN";
 }
 
-/**
- * @brief Builds a JSON HTTP response with the correct Content-Type.
- *
- * Crow (in this version) accepts `crow::response(int, std::string)`. This helper
- * serializes the JSON (`out.dump()`) and ensures the `Content-Type` header is set
- * to `application/json`.
- *
- * @param code HTTP status code to return.
- * @param out  JSON payload to serialize.
- * @return crow::response Fully-initialized Crow response.
- */
 static crow::response json_response(int code, const crow::json::wvalue& out)
 {
     crow::response res(code, out.dump());
@@ -64,70 +47,61 @@ static crow::response json_response(int code, const crow::json::wvalue& out)
     return res;
 }
 
-/**
- * @brief Ensures that `out["data"]` is always a JSON object and never null.
- *
- * Several API responses optionally attach fields under `data` (e.g., `qr`, `jobId`).
- * To keep the response schema stable, this helper initializes `data` as `{}`.
- *
- * @param out JSON object to mutate.
- */
 static void ensure_data_object(crow::json::wvalue& out)
 {
     out["data"] = crow::json::wvalue::empty_object();
 }
 
-/**
- * @brief Constructs the REST server adapter.
- *
- * @param app                Crow application instance used to register routes.
- * @param core               Core domain object.
- * @param dispatcher         Command/job dispatcher facade.
- * @param jobs               Job runner that starts asynchronous jobs.
- * @param store              Job store used for status/result retrieval.
- * @param bind_addr          Bind address/interface (e.g., "0.0.0.0").
- * @param port               TCP port for the HTTP server.
- * @param default_timeout_ms Default job timeout used by /start when not provided.
- */
-RestServer::RestServer(crow::SimpleApp& app, core::Core& core, app::Dispatcher& dispatcher, app::JobRunner& jobs,
-                       app::JobStore& store, std::string bind_addr, int port, int default_timeout_ms)
-    : app_(app), core_(core), dispatcher_(dispatcher), jobs_(jobs), store_(store), bind_addr_(std::move(bind_addr)),
-      port_(port), default_timeout_ms_(default_timeout_ms)
+static crow::response error_response(int code, const std::string& msg)
+{
+    crow::json::wvalue out;
+    out["ok"] = false;
+    out["message"] = msg;
+    return json_response(code, out);
+}
+
+static bool parse_json_object(const crow::request& req, crow::json::rvalue& body, crow::response& err)
+{
+    body = crow::json::load(req.body);
+    if (!body)
+    {
+        err = error_response(400, "ERR:BAD_REQUEST");
+        return false;
+    }
+    if (body.t() != crow::json::type::Object)
+    {
+        err = error_response(400, "ERR:BAD_REQUEST");
+        return false;
+    }
+    return true;
+}
+
+static std::string to_upper_ascii(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+RestServer::RestServer(crow::SimpleApp& app,
+                       core::Core& core,
+                       app::Dispatcher& dispatcher,
+                       app::JobRunner& jobs,
+                       app::JobStore& store,
+                       std::string bind_addr,
+                       int port,
+                       int default_timeout_ms)
+    : app_(app)
+    , core_(core)
+    , dispatcher_(dispatcher)
+    , jobs_(jobs)
+    , store_(store)
+    , bind_addr_(std::move(bind_addr))
+    , port_(port)
+    , default_timeout_ms_(default_timeout_ms)
 {
 }
 
-/**
- * @brief Registers all REST routes on the Crow application.
- *
- * Routes and behavior:
- *
- * - GET /health
- *   Returns a simple liveness response: `{ ok: true, message: "UP" }`.
- *
- * - GET /status
- *   Returns the current core state: `{ ok: true, state: "<STATE>" }`.
- *
- * - POST /command
- *   Body: `{ "command": "<string>" }`
- *   Submits a synchronous command via Dispatcher and waits up to 500ms for readiness.
- *   - 400 if body is invalid or missing required fields
- *   - 503 if the dispatcher is busy (future not ready within 500ms)
- *   - otherwise returns `core::Response.http_status` and a normalized JSON payload:
- *     `{ ok, command, state, message, data:{ qr?, jobId? } }`
- *
- * - POST /start
- *   Optional body: `{ "timeout_ms": <number> }`
- *   Validates timeout, submits a "start job" command via Dispatcher and waits up to 500ms.
- *   - 400 if body is invalid or timeout is invalid (<= 0 or wrong type)
- *   - 503 if dispatcher is busy
- *   - if accepted, starts the asynchronous job via JobRunner and returns 202:
- *     `{ ok: true, jobId, state, message: "ACCEPTED" }`
- *
- * - GET /result/{id}
- *   Polls job state from JobStore:
- *   - 404 if jobId does not exist
- *   - 200 with `{ ok: true, jobId, status, state, message, data:{ qr? } }`
- */
 void RestServer::setup_routes()
 {
     CROW_ROUTE(app_, "/health")
@@ -154,27 +128,83 @@ void RestServer::setup_routes()
         .methods(crow::HTTPMethod::POST)(
             [this](const crow::request& req)
             {
-                auto body = crow::json::load(req.body);
-                if (!body || !body.has("command"))
-                {
-                    crow::json::wvalue out;
-                    out["ok"] = false;
-                    out["message"] = "ERR:BAD_REQUEST";
-                    return json_response(400, out);
-                }
+                crow::json::rvalue body;
+                crow::response err;
+                if (!parse_json_object(req, body, err))
+                    return err;
+
+                if (!body.has("command") || body["command"].t() != crow::json::type::String)
+                    return error_response(400, "ERR:BAD_REQUEST");
 
                 const std::string cmd = body["command"].s();
+                if (cmd.empty())
+                    return error_response(400, "ERR:BAD_REQUEST");
 
-                auto fut = dispatcher_.submit_sync(cmd);
-                if (fut.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+                // If params is present, it must be an object (reject null / array / etc.)
+                if (body.has("params") && body["params"].t() != crow::json::type::Object)
+                    return error_response(400, "ERR:BAD_REQUEST");
+
+                const std::string cmd_up = to_upper_ascii(cmd);
+                spdlog::debug("REST /command received cmd='{}'", cmd_up);
+
+                // Option B: INIT may carry baudrate configuration
+                if (cmd_up == "INIT")
                 {
-                    crow::json::wvalue out;
-                    out["ok"] = false;
-                    out["message"] = "ERR:BUSY";
-                    return json_response(503, out);
+                    int baud = -1;
+
+                    // Accept top-level {"baudrate":115200}
+                    if (body.has("baudrate"))
+                    {
+                        if (body["baudrate"].t() != crow::json::type::Number)
+                            return error_response(400, "ERR:BAD_REQUEST");
+                        baud = static_cast<int>(body["baudrate"].i());
+                    }
+
+                    // Accept {"params":{"baudrate":115200}} as in the OpenAPI
+                    if (baud < 0 && body.has("params"))
+                    {
+                        const auto& p = body["params"];
+                        if (p.has("baudrate"))
+                        {
+                            if (p["baudrate"].t() != crow::json::type::Number)
+                                return error_response(400, "ERR:BAD_REQUEST");
+                            baud = static_cast<int>(p["baudrate"].i());
+                        }
+                    }
+
+                    if (baud > 0)
+                    {
+                        if (baud > 2000000)
+                            return error_response(400, "ERR:BAD_REQUEST");
+                        jobs_.set_baudrate(baud);
+                    }
                 }
 
-                const core::Response r = fut.get();
+                // Enunciado: STOP deve cancelar caso esteja em espera.
+                if (cmd_up == "STOP")
+                {
+                    jobs_.stop();
+                }
+
+                auto fut = dispatcher_.submit_sync(cmd_up);
+                if (fut.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+                    return error_response(503, "ERR:BUSY");
+
+                core::Response r;
+                try
+                {
+                    r = fut.get();
+                }
+                catch (const std::exception& e)
+                {
+                    spdlog::error("Dispatcher submit_sync exception: {}", e.what());
+                    return error_response(500, "ERR:INTERNAL");
+                }
+                catch (...)
+                {
+                    spdlog::error("Dispatcher submit_sync unknown exception");
+                    return error_response(500, "ERR:INTERNAL");
+                }
 
                 crow::json::wvalue out;
                 out["ok"] = r.ok;
@@ -195,63 +225,51 @@ void RestServer::setup_routes()
         .methods(crow::HTTPMethod::POST)(
             [this](const crow::request& req)
             {
+                // Require a JSON object (at least "{}"). This avoids accepting
+                // empty / malformed bodies during fuzzing.
+                crow::json::rvalue body;
+                crow::response err;
+                if (!parse_json_object(req, body, err))
+                    return err;
+
                 int timeout_ms = default_timeout_ms_;
 
-                if (!req.body.empty())
+                if (body.has("timeout_ms"))
                 {
-                    auto body = crow::json::load(req.body);
-                    if (!body)
-                    {
-                        crow::json::wvalue out;
-                        out["ok"] = false;
-                        out["message"] = "ERR:BAD_REQUEST";
-                        return json_response(400, out);
-                    }
+                    if (body["timeout_ms"].t() != crow::json::type::Number)
+                        return error_response(400, "ERR:BAD_REQUEST");
 
-                    if (body.t() != crow::json::type::Object)
-                    {
-                        crow::json::wvalue out;
-                        out["ok"] = false;
-                        out["message"] = "ERR:BAD_REQUEST";
-                        return json_response(400, out);
-                    }
-
-                    if (body.has("timeout_ms"))
-                    {
-                        if (body["timeout_ms"].t() != crow::json::type::Number)
-                        {
-                            crow::json::wvalue out;
-                            out["ok"] = false;
-                            out["message"] = "ERR:BAD_REQUEST";
-                            return json_response(400, out);
-                        }
-                        timeout_ms = static_cast<int>(body["timeout_ms"].i());
-                        if (timeout_ms <= 0)
-                        {
-                            crow::json::wvalue out;
-                            out["ok"] = false;
-                            out["message"] = "ERR:BAD_REQUEST";
-                            return json_response(400, out);
-                        }
-                    }
+                    timeout_ms = static_cast<int>(body["timeout_ms"].i());
+                    if (timeout_ms <= 0)
+                        return error_response(400, "ERR:BAD_REQUEST");
                 }
+
+                spdlog::debug("REST /start received timeout_ms={}", timeout_ms);
 
                 auto fut = dispatcher_.submit_start_job(timeout_ms);
                 if (fut.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+                    return error_response(503, "ERR:BUSY");
+
+                core::Response r;
+                try
                 {
-                    crow::json::wvalue out;
-                    out["ok"] = false;
-                    out["message"] = "ERR:BUSY";
-                    return json_response(503, out);
+                    r = fut.get();
+                }
+                catch (const std::exception& e)
+                {
+                    spdlog::error("Dispatcher submit_start_job exception: {}", e.what());
+                    return error_response(500, "ERR:INTERNAL");
+                }
+                catch (...)
+                {
+                    spdlog::error("Dispatcher submit_start_job unknown exception");
+                    return error_response(500, "ERR:INTERNAL");
                 }
 
-                const core::Response r = fut.get();
                 if (!r.ok)
                 {
-                    crow::json::wvalue out;
-                    out["ok"] = false;
-                    out["message"] = r.message;
-                    return json_response(r.http_status, out);
+                    spdlog::debug("REST /start rejected: status={} msg={}", r.http_status, r.message);
+                    return error_response(r.http_status, r.message);
                 }
 
                 const std::string jobId = jobs_.start(timeout_ms);
@@ -268,13 +286,10 @@ void RestServer::setup_routes()
         .methods(crow::HTTPMethod::GET)(
             [this](const std::string& id)
             {
+                spdlog::debug("REST /result id='{}'", id);
+
                 if (!store_.exists(id))
-                {
-                    crow::json::wvalue out;
-                    out["ok"] = false;
-                    out["message"] = "ERR:NOT_FOUND";
-                    return json_response(404, out);
-                }
+                    return error_response(404, "ERR:NOT_FOUND");
 
                 const auto res = store_.get(id);
 
@@ -291,16 +306,46 @@ void RestServer::setup_routes()
 
                 return json_response(200, out);
             });
+
+    CROW_ROUTE(app_, "/stop")
+        .methods(crow::HTTPMethod::POST)(
+            [this]()
+            {
+                // 1) cancel job if running/waiting
+                jobs_.stop();
+
+                // 2) stop core (serialized via dispatcher)
+                auto fut = dispatcher_.submit_stop();
+                if (fut.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+                    return error_response(503, "ERR:BUSY");
+
+                core::Response r;
+                try
+                {
+                    r = fut.get();
+                }
+                catch (const std::exception& e)
+                {
+                    spdlog::error("Dispatcher submit_stop exception: {}", e.what());
+                    return error_response(500, "ERR:INTERNAL");
+                }
+                catch (...)
+                {
+                    spdlog::error("Dispatcher submit_stop unknown exception");
+                    return error_response(500, "ERR:INTERNAL");
+                }
+
+                crow::json::wvalue out;
+                out["ok"] = r.ok;
+                out["state"] = core::to_string(r.state);
+                out["message"] = r.message;
+                return json_response(r.http_status, out);
+            });
 }
 
-/**
- * @brief Runs the Crow HTTP server.
- *
- * The server binds to the configured address/port and runs in multithreaded mode.
- * This call blocks until the server is stopped.
- */
 void RestServer::run()
 {
+    spdlog::info("REST server binding to {}:{} (default_timeout_ms={})", bind_addr_, port_, default_timeout_ms_);
     app_.bindaddr(bind_addr_).port(port_).multithreaded().run();
 }
 
