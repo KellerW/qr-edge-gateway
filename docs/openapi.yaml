@@ -162,82 +162,75 @@ paths:
                     ok: false
                     message: ERR:BUSY
   /start:
-  post:
-    tags:
+    post:
+      tags:
       - Jobs
-    summary: Start a QR read job (async START)
-    description: >
-      Recommended way to execute START. The service waits up to READ_TIMEOUT_MS
-      (or request override) for a QR read. It returns immediately with 202 + jobId.
-      Poll GET /result/{id} for DONE|TIMEOUT|CANCELLED.
-    operationId: startJob
-    requestBody:
-      required: true
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/StartRequest'
-          examples:
-            default:
-              value: {}
-            override_timeout:
-              value:
-                timeout_ms: 3000
-    responses:
-      '202':
-        description: Job accepted
+      summary: Start a QR read job (async START)
+      description: 'Recommended way to execute START. The service waits up to READ_TIMEOUT_MS
+        (or request override) for a QR read. It returns immediately with 202 + jobId.
+        Poll GET /result/{id} for DONE|TIMEOUT|CANCELLED.
+
+        '
+      operationId: startJob
+      requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/StartResponse'
+              $ref: '#/components/schemas/StartRequest'
             examples:
-              accepted:
+              default:
+                value: {}
+              override_timeout:
                 value:
-                  ok: true
-                  jobId: a1b2c3d4
-                  state: RUNNING
-                  message: ACCEPTED
-      '400':
-        description: Invalid request body (wrong type / invalid fields)
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ErrorResponse'
-            examples:
-              bad_request:
-                value:
-                  ok: false
-                  message: ERR:BAD_REQUEST
-      '409':
-        description: START not allowed in current state (e.g., NOT_INIT, STOPPED, RUNNING)
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ErrorResponse'
-            examples:
-              not_init:
-                value:
-                  ok: false
-                  message: ERR:NOT_INIT
-              stopped:
-                value:
-                  ok: false
-                  message: ERR:STOPPED
-              already_running:
-                value:
-                  ok: false
-                  message: ERR:ALREADY_RUNNING
-      '503':
-        description: Service busy (queue full / cannot accept job)
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ErrorResponse'
-            examples:
-              busy:
-                value:
-                  ok: false
-                  message: ERR:BUSY
+                  timeout_ms: 3000
+      responses:
+        '202':
+          description: Job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartResponse'
+              examples:
+                accepted:
+                  value:
+                    ok: true
+                    jobId: a1b2c3d4
+                    state: RUNNING
+                    message: ACCEPTED
+        '409':
+          description: START not allowed in current state (e.g., NOT_INIT)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                not_init:
+                  value:
+                    ok: false
+                    message: ERR:NOT_INIT
+        '400':
+          description: Invalid request body (wrong type / invalid fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                bad_request:
+                  value:
+                    ok: false
+                    message: ERR:BAD_REQUEST
+        '503':
+          description: Service busy (queue full / cannot accept job)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                busy:
+                  value:
+                    ok: false
+                    message: ERR:BUSY
   /result/{id}:
     get:
       tags:
@@ -363,7 +356,7 @@ components:
               type: integer
               minimum: 1
               description: Optional baudrate to apply on INIT
-              example: 115200
+              example: 2000000
     CommandResponse:
       type: object
       required:
