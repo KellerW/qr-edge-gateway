@@ -12,7 +12,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format cmake ninja-build g++ --no-install-recommends libasio-dev
+          sudo apt-get install -y --no-install-recommends \
+            clang-format cmake ninja-build g++ libasio-dev
 
       - name: Configure (for format target)
         run: cmake -S qr-c/src -B build -G Ninja
@@ -30,7 +31,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ libasio-dev
 
       - name: Configure
         run: |
