@@ -1,153 +1,225 @@
-# Serial Emulation + Command Dispatcher (Fake QR Reader) — Architecture Notes
+# qr-edge-gateway — Fake QR Reader (Serial Emulation + REST API)
 
-This document describes the architecture and operational constraints of the **Fake QR Reader serial emulation** and the **single-threaded command dispatcher** used in this project.
+This repository provides a **containerized fake QR reader** used to validate end-to-end flows where a device reads QR codes from a serial-like interface and exposes results via a REST API.
 
-It is intended to be referenced from the main `README.md` (or placed under `docs/`), and to help with:
-- onboarding and troubleshooting,
-- understanding why PTY sharing across containers fails,
-- extending the system (real serial, more protocols, concurrency, CI).
+It includes:
 
----
-
-## Scope
-
-This document covers **two tightly related concerns**:
-
-1. **Serial Emulation between Docker containers**
-   - How a “serial-like device path” is presented to the consumer container.
-   - Why PTY sharing via volumes does not work in Docker.
-
-2. **Hexagonal architecture + single-threaded dispatcher**
-   - How REST and Serial inputs safely drive the same stateful domain core.
+- **fake-serial**: a TCP-based serial simulator that emits QR payload frames.
+- **qr-c**: a C++ service that bridges TCP → local PTY and exposes a REST API.
+- **api-test**: pytest-based black-box tests.
+- **contract-test**: Schemathesis-based OpenAPI contract testing.
 
 ---
 
-## Component Overview
+## Table of Contents
 
-### Services (logical)
-
-- **fake-serial**  
-  A simulator that emits QR payloads (or protocol frames) as a byte stream over TCP.
-
-- **qr-c**  
-  The consumer container that runs:
-  - a **local PTY** (created inside this container),
-  - a **bridge** (`socat`) between TCP and PTY,
-  - the **C++ application** which opens the PTY path (e.g., `/tmp/ttyS1`) and reads it like a serial stream.
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [API](#api)
+- [Configuration](#configuration)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Repository Layout](#repository-layout)
+- [Notes & Limitations](#notes--limitations)
 
 ---
 
-## Why “PTY sharing via volume” fails
+## Quick Start
 
-A naive design creates a PTY in `fake-serial` and shares `/tmp/ttyS1` via a volume. This fails due to Linux namespaces:
+### 1) Build and run the core services
 
-- `socat pty` creates PTYs under `devpts` (`/dev/pts/N`).
-- Each container has its own `devpts` instance (namespaced `/dev/pts`).
-- The `link=/tmp/ttyS1` is only a **symlink** to `/dev/pts/N` *inside the container that created it*.
-- Sharing `/tmp` shares the symlink text, not the underlying PTY device node.
-- Bind-mounting `/dev/pts` and `/dev/ptmx` across containers is fragile and can break container startup.
+```bash
+docker compose up -d --build fake-serial qr-c
+```
 
-**Conclusion:** A PTY device is not a portable/shared resource across containers. The PTY must exist in the same container where the application opens it.
+Verify readiness:
 
----
+```bash
+curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/status
+```
 
-## Selected Design
+Expected:
 
-### Decision
-Treat “serial” as a **byte-stream transport problem**, not a shared device problem.
+- `/health` → `{"ok":true,"message":"UP"}`
+- `/status` → `{"ok":true,"state":"NOT_INIT"}` (initially)
 
-- Container-to-container transport uses **TCP** (Docker-native).
-- The consumer container creates the local serial endpoint as a **PTY**.
-- `socat` bridges the TCP stream to that PTY.
+### 2) Initialize (INIT) and run a job
 
-### Runtime Data Flow
+INIT (Option B: baudrate via params):
 
-```mermaid
-flowchart LR
-  subgraph Fake["fake-serial container"]
-    F[TCP server\n(emits QR stream)]
-  end
+```bash
+curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"INIT","params":{"baudrate":115200}}'
+```
 
-  subgraph C["qr-c container"]
-    S[socat bridge\nTCP <-> PTY]
-    P["PTY device\n/tmp/ttyS1"]
-    A["C++ app\nopens /tmp/ttyS1"]
-  end
+Start a job:
 
-  F -- TCP:7000 --> S
-  S -- local PTY --> P
-  A -- read bytes --> P
+```bash
+curl -s -X POST http://127.0.0.1:8080/start   -H 'Content-Type: application/json'   -d '{"timeout_ms":3000}'
+```
+
+Poll the result (replace `<jobId>`):
+
+```bash
+curl -s http://127.0.0.1:8080/result/<jobId>
+```
+
+Stop (cancels an active wait and stops the core):
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/stop
 ```
 
 ---
 
-## Hexagonal Architecture + Single-threaded Command Dispatcher
+## Architecture
 
-### Rationale
-The system has multiple concurrent inputs (REST + Serial) that must drive the same stateful behavior reliably.
+### Why PTY sharing across containers fails
 
-We use:
-- **Ports & Adapters (Hexagonal)** for clean boundaries.
-- A **single-threaded Dispatcher** to serialize domain execution.
+A common mistake is to create a PTY in one container and share the `/tmp/ttyS1` link via a volume.
 
-Benefits:
-- deterministic ordering of state transitions,
-- no mutexes in the domain core (core is called only by the dispatcher thread),
-- simpler tests (core is pure logic).
+This fails because:
 
-### Component Interaction
+- PTYs live under `/dev/pts/N` in `devpts`.
+- Each container has its own `devpts` namespace.
+- `link=/tmp/ttyS1` is only a symlink to a PTY that exists *inside the container that created it*.
+- Sharing `/tmp` shares the symlink text, not the PTY node.
+
+**Conclusion:** the PTY must be created in the same container where the application opens it.
+
+### Selected design
+
+- Transport between containers: **TCP**
+- Local serial endpoint for the app: **PTY inside `qr-c`**
+- Bridge: **socat** inside `qr-c`
+
+```mermaid
+flowchart LR
+  subgraph Fake["fake-serial container"]
+    F[TCP server :7000\nemits QR stream]
+  end
+
+  subgraph QRC["qr-c container"]
+    S[socat bridge\nTCP -> PTY]
+    P["PTY /tmp/ttyS1\n(local)"]
+    A["C++ app\nreads /tmp/ttyS1"]
+  end
+
+  F -- TCP:7000 --> S
+  S --> P
+  A --> P
+```
+
+### Domain execution model
+
+- REST requests (Crow) submit work to a **single-threaded Dispatcher**
+- Dispatcher serializes all calls into the Core (state machine)
+- `/start` triggers a job; the JobRunner reads serial data and writes results to JobStore
+- `/result/{id}` polls JobStore
 
 ```mermaid
 flowchart TB
   subgraph Adapters["Adapters"]
     R[REST Adapter\n(Crow)]
-    S[Serial Adapter\n(termios, reconnect)]
   end
 
-  D[Dispatcher\n(single execution thread)]
-  C[Core\n(StateMachine + CommandHandler)]
-  JR[JobRunner\n(background job)]
-  JS[JobStore\n(in-memory results)]
+  D[Dispatcher\n(single worker thread)]
+  C[Core\nState machine]
+  JR[JobRunner\nserial read + timeout + reconnect]
+  JS[JobStore\nin-memory results]
 
   R --> D
-  S --> D
   D --> C
-  C --> D
-
-  D --> JR
   JR --> JS
   R --> JS
 ```
 
-> Note: the exact wiring depends on which commands are synchronous vs. asynchronous (e.g., `/start` spawns a job and `/result/{id}` polls JobStore).
-
 ---
 
-## Compose-level Implementation (reference)
+## API
 
-Typical pattern:
+The OpenAPI specification lives under:
 
-- `fake-serial` runs a TCP server on port `7000`.
-- `qr-c` starts a `socat` bridge that creates `/tmp/ttyS1` locally and forwards bytes from `fake-serial:7000`.
+- `docs/openapi.yaml`
 
-Example bridge command (inside `qr-c` container):
+### Endpoints
 
-```sh
-socat pty,raw,echo=0,link=/tmp/ttyS1 tcp:fake-serial:7000
+- `GET /health`  
+  Returns liveness: `{ ok, message }`
+
+- `GET /status`  
+  Returns Core state: `{ ok, state }`  
+  States: `NOT_INIT | INIT | RUNNING | STOPPED`
+
+- `POST /command`  
+  Executes synchronous commands (`PING`, `INIT`, `STOP`).  
+  Body:
+  ```json
+  {"command":"PING","params":{}}
+  ```
+  Notes:
+  - `params` must be an object if present (never `null`).
+  - `INIT` supports Option B: `params.baudrate` or top-level `baudrate`.
+
+- `POST /start`  
+  Starts an async QR read job. **JSON body required** (at least `{}`).
+  ```json
+  {"timeout_ms":3000}
+  ```
+  Returns `202` with `jobId`. Poll `/result/{id}`.
+
+- `GET /result/{id}`  
+  Returns job status and payload:
+  - `status: PENDING | DONE | TIMEOUT | CANCELLED`
+  - on `DONE`, `data.qr` is present
+
+- `POST /stop`  
+  Cancels an active wait/job and transitions Core to `STOPPED`.
+
+### Examples
+
+PING:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"PING"}'
+```
+
+INIT with baudrate:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"INIT","params":{"baudrate":115200}}'
+```
+
+START:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/start   -H 'Content-Type: application/json'   -d '{"timeout_ms":3000}'
+```
+
+POLL:
+
+```bash
+curl -s http://127.0.0.1:8080/result/<jobId>
+```
+
+STOP:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/stop
 ```
 
 ---
 
-## Operational Notes
+## Configuration
 
-### Environment variables (recommended)
-Use environment variables to keep configuration stable and CI-friendly:
+### Key environment variables
 
+#### `qr-c`
 - `SERIAL_PORT=/tmp/ttyS1`  
-  Path opened by the C++ app.
+  Local PTY path opened by the C++ app.
 
 - `FAKE_SERIAL_HOST=fake-serial`  
-  Docker service name.
+  Docker service name for the TCP serial simulator.
 
 - `FAKE_SERIAL_PORT=7000`  
   TCP port exposed by fake-serial.
@@ -155,84 +227,211 @@ Use environment variables to keep configuration stable and CI-friendly:
 - `REST_BIND=0.0.0.0`
 - `REST_PORT=8080`
 - `READ_TIMEOUT_MS=3000`
+- `REOPEN_DELAY_MS=1000`  
+  Retry delay when opening the PTY fails (serial reopen behavior).
+
+#### `fake-serial`
+- `FAKE_SERIAL_PORT=7000`
+- `PARCEL_PAYLOAD="QR:123456"`
+- `PARCEL_INTERVAL_MS=2000`
+
+### Bridge command (reference)
+
+Inside `qr-c` (typically via `entrypoint.sh`):
+
+```sh
+socat -d -d pty,raw,echo=0,link=/tmp/ttyS1 tcp:fake-serial:7000 &
+```
 
 ---
 
-## Known Limitations / Trade-offs
+## Testing
 
-1. **PTY exists only inside the consumer container**
-   - By design, `/tmp/ttyS1` is local to `qr-c`.
+### 1) API tests (pytest)
 
-2. **Not perfect parity with real USB serial devices**
-   - Some `/dev/ttyUSB*` line-discipline quirks will not be reproduced exactly.
+Runs black-box tests against the running service:
 
-3. **JobStore is in-memory**
-   - Results are lost when the container restarts (no persistence).
+```bash
+docker compose --profile test run --rm --build api-test
+```
 
-4. **Single job policy (current JobRunner design)**
-   - Only one job at a time; starting a new job stops the previous one.
+Expected: `N passed`.
 
-5. **Backpressure not yet explicit**
-   - Dispatcher queue is unbounded in the current sample; production should define queue limits and behavior on overload.
+### 2) Contract tests (Schemathesis)
 
----
+Uses OpenAPI schema to generate tests:
 
-## Troubleshooting (common failures)
+```bash
+docker compose --profile test run --rm --build contract-test
+```
 
-- **`/tmp/ttyS1` exists but app cannot open it**
-  - Ensure `socat` is running in the same container as the app.
-  - Ensure file permissions allow read/write inside the container.
+Notes:
+- The contract-test container performs an `INIT` step before running Schemathesis.
+- The Schemathesis run excludes the `unsupported_method` check (Crow does not set `Allow` header on 405 for TRACE).
 
-- **`/tmp/ttyS1 -> /dev/pts/N` points to a missing PTY**
-  - This typically happens when the PTY was created in a different container. Create PTY in the consumer container.
+### 3) Run both (api-test + contract-test)
 
-- **Container startup fails when mounting `/dev/pts` or `/dev/ptmx`**
-  - Remove those mounts; rely on TCP transport + local PTY.
-
----
-
-## Future Improvements
-
-### Serial / Transport
-- Add **framing/protocol** support (e.g., newline-delimited, STX/ETX, checksum).
-- Add **fault injection** knobs in fake-serial (drop, delay, jitter, disconnect).
-- Add **reconnect/backoff** logic in the SerialAdapter.
-
-### Dispatcher / Domain
-- Add **queue capacity** + overflow policy (reject with `BUSY`, drop, or block with timeout).
-- Add **metrics** (queue depth, command latency, job duration).
-- Add **structured error taxonomy** (stable error codes + mapping to HTTP).
-
-### Jobs
-- Support **multiple concurrent jobs** (map id -> worker) or a job pool.
-- Persist JobStore (Redis / SQLite) if job results must survive restarts.
-- Make job results richer (timestamps, duration, error details, raw frames).
-
-### Observability
-- Add request/response logging with correlation IDs (jobId).
-- Export Prometheus metrics (optional).
-
-### CI / Code Standards
-- Run `format-check` in CI (clang-format).
-- Add optional `clang-tidy` gate for PRs (using `compile_commands.json`).
+```bash
+docker compose --profile test up --build --abort-on-container-exit api-test contract-test
+```
 
 ---
 
-## Where to place diagrams
+## Troubleshooting
 
-If you already have a general architecture diagram under `/diagrams`, add two small diagrams here (or reference them from the general diagram):
+### `/start` returns `ERR:NOT_INIT`
+Run INIT first:
 
-- `diagrams/serial-emulation-dataflow.(png|svg)`  
-  PTY-in-consumer + TCP bridge flow.
+```bash
+curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"INIT"}'
+```
 
-- `diagrams/ports-adapters-dispatcher.(png|svg)`  
-  Hexagonal architecture boundaries + dispatcher.
+### Job never completes (TIMEOUT)
+- Check logs:
+```bash
+docker compose logs -f fake-serial
+docker compose logs -f qr-c
+```
+- Increase `timeout_ms` in `/start`.
+- Ensure the PTY exists inside `qr-c`:
+```bash
+docker compose exec qr-c sh -lc 'ls -l /tmp/ttyS1 || true'
+```
+
+### STOP cancels but job becomes DONE anyway
+This can happen if the fake-serial payload arrives before STOP is processed. For deterministic tests:
+- increase `PARCEL_INTERVAL_MS` during testing (e.g., 10000ms),
+- or call STOP immediately after START.
+
+### Contract-test fails due to spec mismatch
+- Confirm the mounted spec:
+```bash
+docker compose --profile test run --rm contract-test sh -lc 'ls -l /spec && head -n 20 /spec/openapi.yaml'
+```
+- Ensure `docs/openapi.yaml` matches the implementation (CANCELLED, /stop, /start body required).
 
 ---
 
-## Suggested README.md integration
+## Repository Layout
 
-In the main `README.md`, add a short section like:
+```text
+.
+├── docs/
+│   └── openapi.yaml
+├── fake_serial/
+│   ├── Dockerfile
+│   └── fake_serial.c
+├── qr-c/
+│   ├── Dockerfile
+│   └── src/
+│       ├── main.cpp
+│       ├── adapters/rest/RestServer.(hpp|cpp)
+│       ├── app/(Dispatcher|JobRunner|JobStore).(hpp|cpp)
+│       └── core/(Core|Types).(hpp|cpp)
+├── tests/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── test_api.py
+└── tests/contract/
+    └── Dockerfile
+```
 
-> **Architecture note:** See `docs/serial-emulation-and-dispatcher.md` for design rationale, limitations, and extension points.
+---
 
+## Notes & Limitations
+
+- **PTY is local to `qr-c`** by design (not shareable across containers).
+- **JobStore is in-memory** (results are not persisted).
+- **Single-job policy** (current JobRunner runs one job at a time).
+- Serial emulation is a **byte-stream approximation** (not a perfect USB serial replica).
+
+---
+
+## More documentation
+
+- `docs/serial-emulation-and-dispatcher.md` (recommended)  
+  Design rationale, diagrams, constraints, and extension points.
+
+---
+
+## Diagrams
+
+The repository ships PlantUML sources under `Diagrams/`. They are intentionally kept as text so they can be rendered in CI or locally.
+
+Included diagrams:
+
+- `Diagrams/architecture.plantuml` — original high-level context (Cloud MQTT ↔ Gateway ↔ QR adapter ↔ Serial device).
+- `Diagrams/architecture_overview_v2.plantuml` — updated overview including the dev `fake-serial` path and the REST endpoints.
+- `Diagrams/serial_emulation_dataflow.plantuml` — why PTY must be created in the consumer container (TCP → socat → local PTY).
+- `Diagrams/rest_job_sequence.plantuml` — REST sequence (INIT → START → RESULT polling → STOP).
+- `Diagrams/core_state_machine.plantuml` — Core state machine.
+
+### Rendering (recommended)
+
+Using Docker (no local install required):
+
+```bash
+# Render all PlantUML files to SVG under ./Diagrams/out
+mkdir -p Diagrams/out
+docker run --rm -v "$PWD/Diagrams:/work" plantuml/plantuml:latest   -tsvg -o out /work/*.plantuml
+```
+
+You can then reference `Diagrams/out/*.svg` from this README.
+
+### Mermaid alternatives
+
+GitHub renders Mermaid blocks directly, so the README also contains Mermaid diagrams for quick viewing.
+
+
+### Quick-view diagrams (Mermaid)
+
+#### Serial emulation dataflow (DEV)
+
+```mermaid
+flowchart LR
+  F[fake-serial\nTCP :7000\nCOBS frames] --> S[socat\nTCP -> PTY]
+  S --> P[PTY /tmp/ttyS1\n(local to qr-c)]
+  A[C++ app\nreads /tmp/ttyS1] --> P
+```
+
+#### REST job flow
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant REST as qr-c REST
+  participant Disp as Dispatcher
+  participant Core
+  participant JR as JobRunner
+  participant JS as JobStore
+
+  Client->>REST: POST /command (INIT)
+  REST->>Disp: submit_sync(INIT)
+  Disp->>Core: handle_sync_command(INIT)
+  Core-->>Disp: OK (INIT)
+  Disp-->>REST: Response
+  REST-->>Client: 200 OK
+
+  Client->>REST: POST /start {timeout_ms}
+  REST->>Disp: submit_start_job(timeout)
+  Disp->>Core: start_job(timeout)
+  Core-->>Disp: ACCEPTED (RUNNING)
+  Disp-->>REST: ok
+  REST->>JR: start(timeout) -> jobId
+  REST-->>Client: 202 Accepted (jobId)
+
+  loop Poll
+    Client->>REST: GET /result/{jobId}
+    REST->>JS: get(jobId)
+    JS-->>REST: PENDING/DONE/TIMEOUT/CANCELLED (+ data)
+    REST-->>Client: 200 status + data
+  end
+
+  Client->>REST: POST /stop
+  REST->>JR: stop()
+  REST->>Disp: submit_stop()
+  Disp->>Core: stop()
+  Core-->>Disp: STOPPED
+  Disp-->>REST: OK
+  REST-->>Client: 200 OK
+```
