@@ -125,101 +125,147 @@ void RestServer::setup_routes()
             });
 
     CROW_ROUTE(app_, "/command")
-        .methods(crow::HTTPMethod::POST)(
-            [this](const crow::request& req)
+    .methods(crow::HTTPMethod::POST)(
+        [this](const crow::request& req)
+        {
+            crow::json::rvalue body;
+            crow::response err;
+            if (!parse_json_object(req, body, err))
+                return err;
+
+            if (!body.has("command") || body["command"].t() != crow::json::type::String)
+                return error_response(400, "ERR:BAD_REQUEST");
+
+            const std::string cmd = body["command"].s();
+            if (cmd.empty())
+                return error_response(400, "ERR:BAD_REQUEST");
+
+            // If params is present, it must be an object (reject null / array / etc.)
+            if (body.has("params") && body["params"].t() != crow::json::type::Object)
+                return error_response(400, "ERR:BAD_REQUEST");
+
+            // Helper: parse JSON number as STRICT integer (reject float numbers)
+            auto parse_int_field = [&](const crow::json::rvalue& obj,
+                                       const char* key,
+                                       long long& out,
+                                       long long minv,
+                                       long long maxv) -> bool
             {
-                crow::json::rvalue body;
-                crow::response err;
-                if (!parse_json_object(req, body, err))
-                    return err;
+                if (!obj.has(key))
+                    return true; // not present => ok
 
-                if (!body.has("command") || body["command"].t() != crow::json::type::String)
+                if (obj[key].t() != crow::json::type::Number)
+                    return false;
+
+                // Crow stores numbers as "Number" even for doubles; enforce integer-ness
+                const double d = obj[key].d();
+                if (!std::isfinite(d))
+                    return false;
+
+                if (std::floor(d) != d)
+                    return false; // reject non-integer numbers (e.g., 4.6e-201)
+
+                const long long v = static_cast<long long>(d);
+                if (v < minv || v > maxv)
+                    return false;
+
+                out = v;
+                return true;
+            };
+
+            // Generic params validation (even if command ignores them).
+            // Prevent accepting schema-violating requests during fuzzing.
+            int baud_from_params = -1;
+            int timeout_from_params = -1;
+
+            if (body.has("params"))
+            {
+                const auto& p = body["params"];
+
+                long long baud_ll = -1;
+                if (!parse_int_field(p, "baudrate", baud_ll, 1LL, 2000000LL))
                     return error_response(400, "ERR:BAD_REQUEST");
+                if (baud_ll > 0)
+                    baud_from_params = static_cast<int>(baud_ll);
 
-                const std::string cmd = body["command"].s();
-                if (cmd.empty())
+                long long tmo_ll = -1;
+                if (!parse_int_field(p, "timeout_ms", tmo_ll, 1LL, 3600000LL))
                     return error_response(400, "ERR:BAD_REQUEST");
+                if (tmo_ll > 0)
+                    timeout_from_params = static_cast<int>(tmo_ll);
+            }
 
-                // If params is present, it must be an object (reject null / array / etc.)
-                if (body.has("params") && body["params"].t() != crow::json::type::Object)
-                    return error_response(400, "ERR:BAD_REQUEST");
+            const std::string cmd_up = to_upper_ascii(cmd);
+            spdlog::debug("REST /command received cmd='{}'", cmd_up);
 
-                const std::string cmd_up = to_upper_ascii(cmd);
-                spdlog::debug("REST /command received cmd='{}'", cmd_up);
+            // Option B: INIT may carry baudrate configuration
+            if (cmd_up == "INIT")
+            {
+                int baud = -1;
 
-                // Option B: INIT may carry baudrate configuration
-                if (cmd_up == "INIT")
+                // Accept top-level {"baudrate":115200}
+                if (body.has("baudrate"))
                 {
-                    int baud = -1;
+                    if (body["baudrate"].t() != crow::json::type::Number)
+                        return error_response(400, "ERR:BAD_REQUEST");
 
-                    // Accept top-level {"baudrate":115200}
-                    if (body.has("baudrate"))
-                    {
-                        if (body["baudrate"].t() != crow::json::type::Number)
-                            return error_response(400, "ERR:BAD_REQUEST");
-                        baud = static_cast<int>(body["baudrate"].i());
-                    }
+                    const double d = body["baudrate"].d();
+                    if (!std::isfinite(d) || std::floor(d) != d)
+                        return error_response(400, "ERR:BAD_REQUEST");
 
-                    // Accept {"params":{"baudrate":115200}} as in the OpenAPI
-                    if (baud < 0 && body.has("params"))
-                    {
-                        const auto& p = body["params"];
-                        if (p.has("baudrate"))
-                        {
-                            if (p["baudrate"].t() != crow::json::type::Number)
-                                return error_response(400, "ERR:BAD_REQUEST");
-                            baud = static_cast<int>(p["baudrate"].i());
-                        }
-                    }
+                    const long long v = static_cast<long long>(d);
+                    if (v < 1 || v > 2000000)
+                        return error_response(400, "ERR:BAD_REQUEST");
 
-                    if (baud > 0)
-                    {
-                        if (baud > 2000000)
-                            return error_response(400, "ERR:BAD_REQUEST");
-                        jobs_.set_baudrate(baud);
-                    }
+                    baud = static_cast<int>(v);
                 }
 
-                // Enunciado: STOP deve cancelar caso esteja em espera.
-                if (cmd_up == "STOP")
-                {
-                    jobs_.stop();
-                }
+                // Otherwise, use params.baudrate if present
+                if (baud < 0 && baud_from_params > 0)
+                    baud = baud_from_params;
 
-                auto fut = dispatcher_.submit_sync(cmd_up);
-                if (fut.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
-                    return error_response(503, "ERR:BUSY");
+                if (baud > 0)
+                    jobs_.set_baudrate(baud);
+            }
 
-                core::Response r;
-                try
-                {
-                    r = fut.get();
-                }
-                catch (const std::exception& e)
-                {
-                    spdlog::error("Dispatcher submit_sync exception: {}", e.what());
-                    return error_response(500, "ERR:INTERNAL");
-                }
-                catch (...)
-                {
-                    spdlog::error("Dispatcher submit_sync unknown exception");
-                    return error_response(500, "ERR:INTERNAL");
-                }
+            // Enunciado: STOP deve cancelar caso esteja em espera.
+            if (cmd_up == "STOP")
+                jobs_.stop();
 
-                crow::json::wvalue out;
-                out["ok"] = r.ok;
-                out["command"] = r.command;
-                out["state"] = core::to_string(r.state);
-                out["message"] = r.message;
+            auto fut = dispatcher_.submit_sync(cmd_up);
+            if (fut.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+                return error_response(503, "ERR:BUSY");
 
-                ensure_data_object(out);
-                if (r.qr.has_value())
-                    out["data"]["qr"] = *r.qr;
-                if (r.jobId.has_value())
-                    out["data"]["jobId"] = *r.jobId;
+            core::Response r;
+            try
+            {
+                r = fut.get();
+            }
+            catch (const std::exception& e)
+            {
+                spdlog::error("Dispatcher submit_sync exception: {}", e.what());
+                return error_response(500, "ERR:INTERNAL");
+            }
+            catch (...)
+            {
+                spdlog::error("Dispatcher submit_sync unknown exception");
+                return error_response(500, "ERR:INTERNAL");
+            }
 
-                return json_response(r.http_status, out);
-            });
+            crow::json::wvalue out;
+            out["ok"] = r.ok;
+            out["command"] = r.command;
+            out["state"] = core::to_string(r.state);
+            out["message"] = r.message;
+
+            ensure_data_object(out);
+            if (r.qr.has_value())
+                out["data"]["qr"] = *r.qr;
+            if (r.jobId.has_value())
+                out["data"]["jobId"] = *r.jobId;
+
+            return json_response(r.http_status, out);
+        });
 
     CROW_ROUTE(app_, "/start")
         .methods(crow::HTTPMethod::POST)(
