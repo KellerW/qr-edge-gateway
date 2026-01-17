@@ -29,8 +29,8 @@ target_include_directories(qr_c_tests PRIVATE
 )
 
 target_link_libraries(qr_c_tests PRIVATE
+  qr_c_lib
   Catch2::Catch2WithMain
   Threads::Threads
 )
-
 add_test(NAME qr_c_tests COMMAND qr_c_tests)

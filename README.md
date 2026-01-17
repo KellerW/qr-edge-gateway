@@ -2,16 +2,27 @@
 
 This repository provides a **containerized fake QR reader** used to validate end-to-end flows where a device reads QR codes from a serial-like interface and exposes results via a REST API.
 
-It includes:
+It is built to be:
 
-- **fake-serial**: TCP-based simulator that emits QR payload frames.
-- **qr-c**: C++ service that bridges TCP → local PTY and exposes a REST API.
-- **api-test**: pytest-based black-box tests.
-- **contract-test**: Schemathesis-based OpenAPI contract testing.
+- **Container-friendly** (logs to stdout, TCP transport between containers, no shared PTYs)
+- **Deterministic** (single-threaded Core execution via a Dispatcher)
+- **Testable** (pytest black-box tests + OpenAPI contract tests via Schemathesis)
+
+## Contents
+
+- [Quick Start](#quick-start)
+- [What runs where](#what-runs-where)
+- [API](#api)
+- [Testing](#testing)
+- [Diagrams](#diagrams)
+- [Documentation](#documentation)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Quick Start
 
-Build and run the core services:
+Start the core services:
 
 ```bash
 docker compose up -d --build fake-serial qr-c
@@ -24,10 +35,10 @@ curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/status
 ```
 
-Initialize (INIT) and run a job:
+Run a standard flow (INIT → START → RESULT):
 
 ```bash
-# INIT (Option B: baudrate via params)
+# INIT (Option B: set baudrate via params)
 curl -s -X POST http://127.0.0.1:8080/command \
   -H 'Content-Type: application/json' \
   -d '{"command":"INIT","params":{"baudrate":115200}}'
@@ -38,48 +49,56 @@ curl -s -X POST http://127.0.0.1:8080/start \
   -d '{"timeout_ms":3000}'
 ```
 
-Poll the result (replace `<jobId>`):
+Poll result (replace `<jobId>`):
 
 ```bash
 curl -s http://127.0.0.1:8080/result/<jobId>
 ```
 
-Stop (cancels active waits and stops the core):
+Stop (cancel + stop core):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/stop
 ```
 
+---
+
+## What runs where
+
+- **fake-serial**: emits a QR payload stream over TCP (`:7000`)
+- **qr-c**:
+  - creates a **local PTY** (e.g., `/tmp/ttyS1`) inside this container
+  - bridges TCP → PTY using `socat`
+  - runs the C++ service:
+    - REST API (Crow)
+    - Core (state machine)
+    - Dispatcher (single worker thread)
+    - JobRunner + JobStore (async job + polling)
+
+Key constraint: **do not share PTYs across containers**. PTYs live in `/dev/pts` and are namespaced per container; a `/tmp/ttyS1` link created in one container is not usable in another.
+
+---
+
 ## API
 
-OpenAPI spec:
+OpenAPI specification:
 
 - `docs/openapi.yaml`
 
 Endpoints:
 
-- `GET /health` → `{ ok, message }`
-- `GET /status` → `{ ok, state }`
-- `POST /command` → sync commands (`PING`, `INIT`, `STOP`)
-- `POST /start` → async job start (JSON body required)
-- `GET /result/{id}` → `PENDING | DONE | TIMEOUT | CANCELLED`
-- `POST /stop` → cancels active wait + stops core
+- `GET /health` — liveness
+- `GET /status` — Core state (`NOT_INIT|INIT|RUNNING|STOPPED`)
+- `POST /command` — synchronous commands (`PING`, `INIT`, `STOP`)
+- `POST /start` — async job start (**JSON body required**)
+- `GET /result/{id}` — poll job result (`PENDING|DONE|TIMEOUT|CANCELLED`)
+- `POST /stop` — cancel active wait + transition to STOPPED
 
-## Configuration (key env vars)
+For detailed request/response semantics and constraints, see:
+- `docs/OPERATIONS.md` (curl flows)
+- `docs/PROTOCOL.md` (serial framing + payload expectations)
 
-### qr-c
-- `SERIAL_PORT=/tmp/ttyS1`
-- `FAKE_SERIAL_HOST=fake-serial`
-- `FAKE_SERIAL_PORT=7000`
-- `REST_BIND=0.0.0.0`
-- `REST_PORT=8080`
-- `READ_TIMEOUT_MS=3000`
-- `REOPEN_DELAY_MS=1000`
-
-### fake-serial
-- `FAKE_SERIAL_PORT=7000`
-- `PARCEL_PAYLOAD="QR:123456"`
-- `PARCEL_INTERVAL_MS=2000`
+---
 
 ## Testing
 
@@ -95,19 +114,18 @@ docker compose --profile test run --rm --build api-test
 docker compose --profile test run --rm --build contract-test
 ```
 
-Notes:
-- Contract tests run an INIT pre-step.
-- Schemathesis excludes the `unsupported_method` check (Crow 405 does not include RFC-required `Allow` header for TRACE).
+Contract testing notes (why `unsupported_method` is excluded, how to keep OpenAPI aligned):
+- `docs/CONTRACT_TESTING.md`
 
-## Diagrams (PlantUML → SVG)
+---
 
-The authoritative diagram sources are PlantUML files under `diagrams/`.
+## Diagrams
 
-GitHub does not render PlantUML sources directly, therefore we **render SVGs** and keep them under `diagrams/out/` so they are visible in the repository UI and inside this README.
+This repository keeps PlantUML sources under `diagrams/` and **rendered SVGs** under `diagrams/out/` so diagrams are visible in GitHub.
 
-### Render to SVG (recommended)
+### Render diagrams
 
-Using Docker (no local install required):
+Using Docker:
 
 ```bash
 mkdir -p diagrams/out
@@ -115,41 +133,67 @@ docker run --rm -v "$PWD/diagrams:/work" plantuml/plantuml:latest \
   -tsvg -o out /work/*.plantuml
 ```
 
-Or use the helper script:
+Or use:
 
 ```bash
 ./render_diagrams.sh
 ```
 
-### Embedded diagrams (SVG)
+Commit the generated `diagrams/out/*.svg` so they display in GitHub.
 
-> These images will appear after you render and commit `diagrams/out/*.svg`.
+### Diagram: architecture overview
 
-#### Architecture overview
+**What it explains:** end-to-end context (cloud ↔ gateway ↔ QR adapter ↔ serial), and how DEV emulation differs from PROD serial.
 
 ![Architecture overview](diagrams/out/architecture_overview_v2.svg)
 
-#### Serial emulation dataflow (DEV)
+If you want the original version, also render and embed:
+- `diagrams/architecture.plantuml`
+
+### Diagram: serial emulation dataflow (DEV)
+
+**What it explains:** why the PTY must be created in the *consumer* container (`qr-c`), and how the TCP stream becomes a local serial-like device.
 
 ![Serial emulation dataflow](diagrams/out/serial_emulation_dataflow.svg)
 
-#### REST job sequence
+### Diagram: REST job sequence
+
+**What it explains:** request/response ordering and component responsibilities (REST → Dispatcher/Core, async job in JobRunner, polling via JobStore).
 
 ![REST job sequence](diagrams/out/rest_job_sequence.svg)
 
-#### Core state machine
+### Diagram: Core state machine
+
+**What it explains:** allowed transitions between `NOT_INIT`, `INIT`, `RUNNING`, `STOPPED` and how `/start`, job completion, and `/stop` interact.
 
 ![Core state machine](diagrams/out/core_state_machine.svg)
 
-#### Compose deployment view
+### Diagram: Compose deployment view
+
+**What it explains:** ports, volumes, healthchecks, and how test profiles attach to the main services.
 
 ![Compose deployment](diagrams/out/compose_deployment.svg)
 
-#### Testing pipeline (profiles)
+### Diagram: Testing pipeline
+
+**What it explains:** how CI-like runs work (healthchecks → api-test + contract-test) and what the contract-test actually does.
 
 ![Testing pipeline](diagrams/out/testing_pipeline.svg)
 
-## Troubleshooting (common)
+---
+
+## Documentation
+
+Minimal documentation set under `docs/`:
+
+- `docs/ARCHITECTURE.md` — rationale (PTY namespaces, dispatcher model)
+- `docs/PROTOCOL.md` — framing (COBS + 0x00), payload expectations, limits
+- `docs/OPERATIONS.md` — common curl flows, env vars, logs
+- `docs/CONTRACT_TESTING.md` — Schemathesis notes and OpenAPI maintenance
+
+---
+
+## Troubleshooting
 
 ### `/start` returns `ERR:NOT_INIT`
 Run INIT first:
@@ -162,21 +206,19 @@ curl -s -X POST http://127.0.0.1:8080/command \
 
 ### Job times out (TIMEOUT)
 - Check logs:
+
 ```bash
 docker compose logs -f fake-serial
 docker compose logs -f qr-c
 ```
+
 - Increase `timeout_ms` in `/start`
-- Ensure `/tmp/ttyS1` exists inside `qr-c`:
+- Ensure the PTY exists inside `qr-c`:
+
 ```bash
 docker compose exec qr-c sh -lc 'ls -l /tmp/ttyS1 || true'
 ```
 
-## Documentation set (recommended)
-
-If you want a minimal, clean docs set under `docs/`:
-
-- `docs/ARCHITECTURE.md` — rationale (PTY namespaces, dispatcher model).
-- `docs/PROTOCOL.md` — framing (COBS + 0x00), payload expectations (`QR:...`), limits.
-- `docs/OPERATIONS.md` — common curl flows, env vars, logs.
-- `docs/CONTRACT_TESTING.md` — Schemathesis notes and OpenAPI maintenance.
+### Contract test failures
+- Ensure the mounted OpenAPI is up to date (`docs/openapi.yaml`)
+- See: `docs/CONTRACT_TESTING.md`
