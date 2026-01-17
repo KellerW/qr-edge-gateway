@@ -102,5 +102,13 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
-
+mqtt:
+  image: eclipse-mosquitto:2
+  ports:
+    - "1883:1883"
+  healthcheck:
+    test: ["CMD-SHELL", "nc -z 127.0.0.1 1883"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
   
