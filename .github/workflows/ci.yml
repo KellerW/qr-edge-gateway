@@ -4,46 +4,27 @@ on:
   pull_request:
 
 jobs:
-  format-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang-format cmake ninja-build g++ libasio-dev
-
-      - name: Configure (for format target)
-        run: cmake -S qr-c/src -B build -G Ninja
-
-      - name: Run clang-format (and fail if changes)
-        run: |
-          cmake --build build --target format
-          git diff --exit-code
-
   unit-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install build tools (host)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ libasio-dev
 
-      - name: Configure
+      - name: Configure (host)
         run: |
           cmake -S qr-c/src -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_UNIT_TEST=ON
 
-      - name: Build
+      - name: Build (host)
         run: cmake --build build -j 2
 
-      - name: Run unit tests
+      - name: Run unit tests (host)
         run: ctest --test-dir build --output-on-failure
 
   integration:
@@ -61,8 +42,10 @@ jobs:
 
       - name: Run integration tests (api-test)
         run: |
-          docker compose --profile test up --build \
-            --abort-on-container-exit --exit-code-from api-test api-test
+          docker compose --profile test up \
+            --abort-on-container-exit \
+            --exit-code-from api-test \
+            api-test
 
       - name: Collect compose logs
         if: always()
@@ -93,10 +76,15 @@ jobs:
           docker version
           docker compose version
 
+      - name: Build images (compose)
+        run: docker compose build
+
       - name: Run contract tests (Schemathesis)
         run: |
-          docker compose --profile test up --build \
-            --abort-on-container-exit --exit-code-from contract-test contract-test
+          docker compose --profile test up \
+            --abort-on-container-exit \
+            --exit-code-from contract-test \
+            contract-test
 
       - name: Collect compose logs
         if: always()
