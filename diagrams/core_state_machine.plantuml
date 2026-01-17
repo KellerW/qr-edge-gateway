@@ -1,0 +1,22 @@
+@startuml
+skinparam shadowing false
+skinparam defaultFontName "Arial"
+
+[*] --> NOT_INIT
+
+NOT_INIT --> INIT : INIT\n(/command INIT)
+NOT_INIT --> NOT_INIT : PING\n(/command PING)\n(no state change)
+NOT_INIT --> STOPPED : STOP\n(/command STOP or /stop)
+
+INIT --> RUNNING : START accepted\n(/start)
+INIT --> INIT : PING\n(/command PING)
+INIT --> STOPPED : STOP\n(/command STOP or /stop)
+
+RUNNING --> INIT : job finished\n(DONE/TIMEOUT/CANCELLED)\nsubmit_finish_job()
+RUNNING --> STOPPED : STOP\n(/stop or /command STOP)
+
+STOPPED --> INIT : INIT\n(/command INIT)\n(idempotent)
+STOPPED --> STOPPED : STOP\n(idempotent)
+STOPPED --> STOPPED : PING\n(/command PING)\n(no state change)
+
+@enduml

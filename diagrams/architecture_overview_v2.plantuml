@@ -1,0 +1,51 @@
+@startuml
+' ----------------- Look & feel -----------------
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "Arial"
+skinparam rectangle {
+  RoundCorner 8
+  BorderColor #555555
+  BackgroundColor #F5F5F5
+}
+skinparam node {
+  BorderColor #555555
+  BackgroundColor #FFFFFF
+}
+skinparam cloud {
+  BackgroundColor #FFFFFF
+  BorderColor #555555
+}
+top to bottom direction
+
+' ----------------- Cloud MQTT broker -----------------
+cloud "Cloud MQTT Broker\n(test.mosquitto.org)\nMQTT/TLS : 8883" as Cloud
+
+' ----------------- Edge host + Docker network -----------------
+node "Edge Device / Docker Host" as Host {
+
+  node "Docker internal network" as DockerNet {
+
+    component "<b>Container B</b>\n«MQTT gateway»\n gateway-py (Python)\n\n- subscribes: from_cloud/commands\n- publishes: from_device/events" as B
+
+    component "<b>Container A</b>\n«QR adapter»\n qr-c (C++)\n\nREST API:\n- POST /command (PING|INIT|STOP)\n- POST /start\n- GET  /result/{id}\n- POST /stop\n- GET  /health, /status" as A
+
+    component "<b>fake-serial</b>\n«simulator»\nTCP :7000\nemits COBS frames" as F
+  }
+
+  node "Real QR Device\n/dev/ttyUSB0\n(Production)" as Serial
+}
+
+' ----------------- MQTT between cloud and gateway -----------------
+Cloud -down-> B : from_cloud/commands\nMQTT/TLS : 8883
+B -up-> Cloud : from_device/events\nMQTT/TLS : 8883
+
+' ----------------- REST between gateway and adapter -----------------
+B -down-> A : REST/HTTP\n(e.g., /start, /result/{id})
+A -up-> B : JSON responses
+
+' ----------------- Serial: dev vs prod -----------------
+F -right-> A : DEV: TCP stream\n(socat -> local PTY)
+A -down-> Serial : PROD: UART 115200 8N1
+
+@enduml

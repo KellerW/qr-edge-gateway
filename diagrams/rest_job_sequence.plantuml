@@ -1,0 +1,48 @@
+@startuml
+skinparam shadowing false
+skinparam defaultFontName "Arial"
+
+actor Client as Client
+participant "qr-c REST\n(Crow)" as REST
+participant "Dispatcher\n(single thread)" as Disp
+participant "Core\n(state machine)" as Core
+participant "JobRunner\n(background)" as JR
+participant "JobStore" as JS
+participant "Serial/PTY" as Ser
+
+== Initialize ==
+Client -> REST : POST /command {"command":"INIT","params":{"baudrate":115200}}
+REST -> Disp : submit_sync("INIT")
+Disp -> Core : handle_sync_command(INIT)
+Core --> Disp : OK (state=INIT)
+Disp --> REST : Response
+REST --> Client : 200 OK {state:"INIT"}
+
+== Start job ==
+Client -> REST : POST /start {"timeout_ms":3000}
+REST -> Disp : submit_start_job(3000)
+Disp -> Core : start_job(3000)
+Core --> Disp : ACCEPTED (state=RUNNING)
+Disp --> REST : ok
+REST -> JR : start(timeout=3000)\n(create jobId, set PENDING)
+JR -> Ser : open/read /tmp/ttyS1\n(wait COBS frame)
+REST --> Client : 202 Accepted {jobId}
+
+== Poll ==
+loop until DONE/TIMEOUT/CANCELLED
+  Client -> REST : GET /result/{jobId}
+  REST -> JS : get(jobId)
+  JS --> REST : status + data
+  REST --> Client : 200 {status, data}
+end
+
+== Stop ==
+Client -> REST : POST /stop
+REST -> JR : stop() (cancel wait)
+REST -> Disp : submit_stop()
+Disp -> Core : stop()
+Core --> Disp : OK (state=STOPPED)
+Disp --> REST : OK
+REST --> Client : 200 OK {state:"STOPPED"}
+
+@enduml

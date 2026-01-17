@@ -1,0 +1,26 @@
+@startuml
+skinparam shadowing false
+skinparam defaultFontName "Arial"
+skinparam componentStyle rectangle
+left to right direction
+
+rectangle "fake-serial\n(TCP server :7000)" as Fake
+rectangle "qr-c container" as QRC {
+  rectangle "socat\nTCP -> PTY" as Socat
+  rectangle "PTY device\n/tmp/ttyS1\n(local to qr-c)" as PTY
+  rectangle "C++ app\nJobRunner reads frames\n(COBS + 0x00 delimiter)" as App
+}
+
+Fake --> Socat : TCP byte stream\n(COBS frames)
+Socat --> PTY : creates local PTY\nand writes bytes
+App --> PTY : open/read /tmp/ttyS1
+
+note right of PTY
+PTY nodes live in /dev/pts (devpts)
+and are namespaced per container.
+
+Do NOT share /tmp/ttyS1 via volume
+from another container.
+end note
+
+@enduml
