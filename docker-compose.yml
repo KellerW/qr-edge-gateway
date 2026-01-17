@@ -24,15 +24,8 @@ services:
       FAKE_SERIAL_PORT: 7000
       REST_BIND: 0.0.0.0
       REST_PORT: 8080
-      # Se o seu entrypoint ainda usa LOG_PATH, descomente:
-      # LOG_PATH: /var/log/qr-c/qr-c.log
-      # Se você usa o novo logging:
-      # LOG_LEVEL: info
-      # LOG_FILE: ""   # stdout only
     ports:
       - "8080:8080"
-    #volumes:
-    #  - ./logs/qr-c:/var/log/qr-c
     depends_on:
       fake-serial:
         condition: service_healthy
@@ -67,26 +60,45 @@ services:
         condition: service_healthy
     volumes:
       - ./docs:/spec:ro
+
   unit-test:
     profiles: ["test"]
     build:
       context: ./qr-c
       dockerfile: Dockerfile
       target: build
-    command: sh -lc "ctest --test-dir /work/build --output-on-failure"
+    # Reconfigure in-container to ensure tests are enabled
+    command: >
+      sh -lc "
+        cmake -S /work/src -B /work/build -DCMAKE_BUILD_TYPE=Release -DENABLE_UNIT_TEST=ON &&
+        cmake --build /work/build -j\$(nproc) &&
+        ctest --test-dir /work/build --output-on-failure
+      "
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 1883"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   gateway-py:
     build:
       context: ./gateway-py
       dockerfile: Dockerfile
     environment:
-      MQTT_HOST: broker.emqx.io
-      MQTT_PORT: 8883
-      MQTT_CERT: /tmp/broker.emqx.io-ca.crt
-      MQTT_TOPIC_CMD: from_cloud/commands
-      MQTT_TOPIC_EVENT: from_device/events
+      # Use local broker by default (stable for CI)
+      MQTT_HOST: mqtt
+      MQTT_PORT: 1883
+      MQTT_TOPIC_CMD: from_cloud/commands/wkeller
+      MQTT_TOPIC_EVENT: from_device/events/wkeller
+
       LOG_PATH: /var/log/gateway-py/gateway.log
       QR_API_BASE_URL: http://qr-c:8080
+
       QR_START_TIMEOUT_MS: 1000
       POLL_INTERVAL_SEC: 0.3
       POLL_MAX_SECONDS: 6.0
@@ -95,20 +107,11 @@ services:
     depends_on:
       qr-c:
         condition: service_healthy
+      mqtt:
+        condition: service_healthy
     healthcheck:
-      # Simple check: process exists
-      test: ["CMD-SHELL", "python -c 'import os,signal; os.kill(1,0)'"]
+      test: ["CMD-SHELL", "python -c 'import os; os.kill(1,0)'"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 10s
-mqtt:
-  image: eclipse-mosquitto:2
-  ports:
-    - "1883:1883"
-  healthcheck:
-    test: ["CMD-SHELL", "nc -z 127.0.0.1 1883"]
-    interval: 5s
-    timeout: 3s
-    retries: 10
-  
