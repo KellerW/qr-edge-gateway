@@ -2,7 +2,8 @@ import json
 import os
 import time
 import logging
-from typing import Any, Dict, Optional
+import threading
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 import paho.mqtt.client as mqtt
@@ -21,6 +22,14 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v else default
+    except ValueError:
+        return default
+
+
 MQTT_HOST = env_str("MQTT_HOST", "test.mosquitto.org")
 MQTT_PORT = env_int("MQTT_PORT", 8883)
 MQTT_CERT = env_str("MQTT_CERT", "/tmp/mosquitto.org.crt")
@@ -32,8 +41,14 @@ QR_START_TIMEOUT_MS = env_int("QR_START_TIMEOUT_MS", 1000)
 
 LOG_PATH = env_str("LOG_PATH", "/var/log/gateway-py/gateway.log")
 
-POLL_INTERVAL_SEC = float(env_str("POLL_INTERVAL_SEC", "0.3"))
-POLL_MAX_SECONDS = float(env_str("POLL_MAX_SECONDS", "6.0"))
+POLL_INTERVAL_SEC = env_float("POLL_INTERVAL_SEC", 0.3)
+POLL_MAX_SECONDS = env_float("POLL_MAX_SECONDS", 6.0)
+
+HTTP_TIMEOUT_SEC = env_float("HTTP_TIMEOUT_SEC", 5.0)
+
+# Keep aligned with qr-c validation / OpenAPI
+BAUD_MIN = 1
+BAUD_MAX = 2_000_000
 
 
 def setup_logger() -> logging.Logger:
@@ -46,19 +61,50 @@ def setup_logger() -> logging.Logger:
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 
+    # Optional file logging (works only if volume mounted)
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
         fh = logging.FileHandler(LOG_PATH)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     except Exception:
-        # If file logging fails, console is still fine.
         pass
 
     return logger
 
 
 log = setup_logger()
+http = requests.Session()
+
+
+def safe_json(resp: requests.Response) -> Dict[str, Any]:
+    if not resp.content:
+        return {}
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def http_post(path: str, body: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    url = f"{QR_API_BASE_URL}{path}"
+    try:
+        payload = body if body is not None else {}
+        r = http.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
+        return r.status_code, safe_json(r)
+    except Exception as e:
+        log.warning("HTTP POST %s failed: %s", url, e)
+        return 0, {"ok": False, "message": "ERR:HTTP"}
+
+
+def http_get(path: str) -> Tuple[int, Dict[str, Any]]:
+    url = f"{QR_API_BASE_URL}{path}"
+    try:
+        r = http.get(url, timeout=HTTP_TIMEOUT_SEC)
+        return r.status_code, safe_json(r)
+    except Exception as e:
+        log.warning("HTTP GET %s failed: %s", url, e)
+        return 0, {"ok": False, "message": "ERR:HTTP"}
 
 
 def publish_event(client: mqtt.Client, payload: Dict[str, Any]) -> None:
@@ -67,61 +113,142 @@ def publish_event(client: mqtt.Client, payload: Dict[str, Any]) -> None:
     log.info("MQTT publish -> %s: %s", TOPIC_EVT, msg)
 
 
-def http_post(path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{QR_API_BASE_URL}{path}"
-    r = requests.post(url, json=body, timeout=5)
-    return {"status_code": r.status_code, "json": r.json() if r.content else {}}
+def normalize_cmd(cmd: str) -> str:
+    return cmd.strip().upper()
 
 
-def http_get(path: str) -> Dict[str, Any]:
-    url = f"{QR_API_BASE_URL}{path}"
-    r = requests.get(url, timeout=5)
-    return {"status_code": r.status_code, "json": r.json() if r.content else {}}
+def make_cmd_id(data: Dict[str, Any]) -> str:
+    cid = str(data.get("id", "")).strip()
+    if cid:
+        return cid
+    return f"cmd-{int(time.time() * 1000)}"
 
 
-def handle_command(client: mqtt.Client, cmd: str) -> None:
+def validate_params(params: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Validate params according to qr-c expectations:
+    - params must be object if present (already checked by caller)
+    - baudrate must be integer in [1..2_000_000] if present
+    - timeout_ms must be integer > 0 if present
+    """
+    if params is None:
+        return None
+
+    if "baudrate" in params:
+        br = params.get("baudrate")
+        if not isinstance(br, int):
+            return "ERR:BAD_REQUEST"
+        if br < BAUD_MIN or br > BAUD_MAX:
+            return "ERR:BAD_REQUEST"
+
+    if "timeout_ms" in params:
+        tmo = params.get("timeout_ms")
+        if not isinstance(tmo, int):
+            return "ERR:BAD_REQUEST"
+        if tmo <= 0:
+            return "ERR:BAD_REQUEST"
+
+    return None
+
+
+def dispatch_in_thread(fn, *args, **kwargs) -> None:
+    t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+    t.start()
+
+
+def handle_command_sync(client: mqtt.Client, cmd_id: str, cmd: str, params: Optional[Dict[str, Any]] = None) -> None:
     # Maps to qr-c POST /command
-    res = http_post("/command", {"command": cmd})
-    payload = res["json"]
-    payload.setdefault("type", "command_ack")
-    publish_event(client, payload)
+    req: Dict[str, Any] = {"command": cmd}
+    if params is not None:
+        req["params"] = params
+
+    sc, j = http_post("/command", req)
+
+    out = {
+        "id": cmd_id,
+        "type": "command_ack",
+        "http_status": sc,
+        "ok": j.get("ok", False),
+        "command": j.get("command", cmd),
+        "state": j.get("state"),
+        "message": j.get("message", "ERR"),
+        "data": j.get("data", {}),
+    }
+    publish_event(client, out)
 
 
-def handle_start(client: mqtt.Client, timeout_ms: int) -> None:
+def handle_stop(client: mqtt.Client, cmd_id: str) -> None:
+    # STOP must call /stop (cancel active wait + stop core)
+    sc, j = http_post("/stop", {})
+
+    out = {
+        "id": cmd_id,
+        "type": "stop_ack",
+        "http_status": sc,
+        "ok": j.get("ok", False),
+        "state": j.get("state"),
+        "message": j.get("message", "ERR"),
+    }
+    publish_event(client, out)
+
+
+def handle_start_and_poll(client: mqtt.Client, cmd_id: str, timeout_ms: int) -> None:
     # Calls qr-c POST /start then polls /result/{jobId}
-    res = http_post("/start", {"timeout_ms": timeout_ms})
-    j = res["json"]
+    sc, j = http_post("/start", {"timeout_ms": timeout_ms})
 
-    if res["status_code"] != 202:
-        # start rejected
-        publish_event(client, {"type": "job_rejected", "ok": False, "message": j.get("message", "ERR")})
+    if sc != 202:
+        publish_event(client, {
+            "id": cmd_id,
+            "type": "job_rejected",
+            "http_status": sc,
+            "ok": False,
+            "message": j.get("message", "ERR"),
+        })
         return
 
-    job_id = j.get("jobId")
-    publish_event(client, {"type": "job_accepted", "jobId": job_id, "state": j.get("state"), "message": j.get("message")})
+    job_id = j.get("jobId", "")
+    publish_event(client, {
+        "id": cmd_id,
+        "type": "job_accepted",
+        "http_status": sc,
+        "ok": True,
+        "jobId": job_id,
+        "state": j.get("state"),
+        "message": j.get("message"),
+    })
 
     deadline = time.time() + POLL_MAX_SECONDS
     while time.time() < deadline:
-        gr = http_get(f"/result/{job_id}")
-        gj = gr["json"]
-        if gr["status_code"] == 200:
+        gsc, gj = http_get(f"/result/{job_id}")
+        if gsc == 200:
             status = gj.get("status")
-            if status in ("DONE", "TIMEOUT"):
+            if status in ("DONE", "TIMEOUT", "CANCELLED"):
                 out = {
+                    "id": cmd_id,
                     "type": "job_result",
+                    "http_status": gsc,
+                    "ok": True,
                     "jobId": job_id,
                     "status": status,
                     "message": gj.get("message"),
                     "state": gj.get("state"),
                 }
                 data = gj.get("data") or {}
-                if "qr" in data:
+                if isinstance(data, dict) and "qr" in data:
                     out["qr"] = data["qr"]
                 publish_event(client, out)
                 return
+
         time.sleep(POLL_INTERVAL_SEC)
 
-    publish_event(client, {"type": "job_result", "jobId": job_id, "status": "TIMEOUT", "message": "ERR:POLL_TIMEOUT"})
+    publish_event(client, {
+        "id": cmd_id,
+        "type": "job_result",
+        "ok": False,
+        "jobId": job_id,
+        "status": "TIMEOUT",
+        "message": "ERR:POLL_TIMEOUT",
+    })
 
 
 def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties=None):
@@ -136,26 +263,48 @@ def on_message(client: mqtt.Client, userdata, msg: mqtt.MQTTMessage):
         log.info("MQTT recv <- %s: %s", msg.topic, payload)
 
         data = json.loads(payload) if payload else {}
-        msg_type = data.get("type", "command")
+        msg_type = str(data.get("type", "command")).strip().lower()
+        cmd_id = make_cmd_id(data)
 
         if msg_type == "command":
-            cmd = str(data.get("command", "")).strip()
+            cmd = normalize_cmd(str(data.get("command", "")))
             if not cmd:
-                publish_event(client, {"type": "error", "message": "ERR:BAD_REQUEST"})
+                publish_event(client, {"id": cmd_id, "type": "error", "message": "ERR:BAD_REQUEST"})
                 return
 
-            # If cloud sends START as command, treat it as async start.
-            if cmd.upper() == "START":
-                handle_start(client, int(data.get("timeout_ms", QR_START_TIMEOUT_MS)))
-            else:
-                handle_command(client, cmd)
+            params = data.get("params")
+            if params is not None and not isinstance(params, dict):
+                publish_event(client, {"id": cmd_id, "type": "error", "message": "ERR:BAD_REQUEST"})
+                return
 
-        elif msg_type == "start":
+            err = validate_params(params)
+            if err:
+                publish_event(client, {"id": cmd_id, "type": "error", "message": err})
+                return
+
+            if cmd == "START":
+                timeout_ms = int(data.get("timeout_ms", QR_START_TIMEOUT_MS))
+                dispatch_in_thread(handle_start_and_poll, client, cmd_id, timeout_ms)
+                return
+
+            if cmd == "STOP":
+                dispatch_in_thread(handle_stop, client, cmd_id)
+                return
+
+            # INIT / PING / others map to /command
+            dispatch_in_thread(handle_command_sync, client, cmd_id, cmd, params)
+            return
+
+        if msg_type == "start":
             timeout_ms = int(data.get("timeout_ms", QR_START_TIMEOUT_MS))
-            handle_start(client, timeout_ms)
+            dispatch_in_thread(handle_start_and_poll, client, cmd_id, timeout_ms)
+            return
 
-        else:
-            publish_event(client, {"type": "error", "message": "ERR:UNKNOWN_MESSAGE_TYPE"})
+        if msg_type == "stop":
+            dispatch_in_thread(handle_stop, client, cmd_id)
+            return
+
+        publish_event(client, {"id": cmd_id, "type": "error", "message": "ERR:UNKNOWN_MESSAGE_TYPE"})
 
     except Exception as e:
         log.exception("on_message error: %s", e)
@@ -176,7 +325,6 @@ def main() -> None:
     client.on_connect = on_connect
     client.on_message = on_message
 
-    # Auto-reconnect with backoff
     client.reconnect_delay_set(min_delay=1, max_delay=30)
 
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)

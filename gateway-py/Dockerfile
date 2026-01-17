@@ -6,19 +6,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY gateway.py .
+COPY gateway.py /app/gateway.py
 
-# Baixa o certificado do Mosquitto (CA) no runtime, se não existir.
-# (URL apenas em code block, conforme boas práticas)
-CMD sh -lc '\
+# Container-friendly: log folder exists, CA cert is fetched if missing, then run
+CMD ["sh", "-lc", "\
   mkdir -p /var/log/gateway-py && \
-  touch "${LOG_PATH:-/var/log/gateway-py/gateway.log}" && \
-  if [ ! -f "${MQTT_CERT:-/tmp/mosquitto.org.crt}" ]; then \
-    echo "[gateway-py] downloading mosquitto.org.crt to ${MQTT_CERT:-/tmp/mosquitto.org.crt}"; \
-    curl -fsSL "https://test.mosquitto.org/ssl/mosquitto.org.crt" -o "${MQTT_CERT:-/tmp/mosquitto.org.crt}"; \
+  touch \"${LOG_PATH:-/var/log/gateway-py/gateway.log}\" && \
+  if [ ! -f \"${MQTT_CERT:-/tmp/broker.emqx.io-ca.crt}\" ]; then \
+    echo \"[gateway-py] downloading broker.emqx.io CA to ${MQTT_CERT:-/tmp/broker.emqx.io-ca.crt}\"; \
+    curl -fsSL \"https://assets.emqx.com/data/broker.emqx.io-ca.crt\" -o \"${MQTT_CERT:-/tmp/broker.emqx.io-ca.crt}\"; \
   fi && \
-  python -u gateway.py \
-'
+  python -u /app/gateway.py \
+"]

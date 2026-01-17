@@ -75,27 +75,32 @@ services:
       target: build
     command: sh -lc "ctest --test-dir /work/build --output-on-failure"
 
-
   gateway-py:
-    image: python:3.12-slim
-    working_dir: /app
+    build:
+      context: ./gateway-py
+      dockerfile: Dockerfile
     environment:
-      MQTT_HOST: test.mosquitto.org
+      MQTT_HOST: broker.emqx.io
       MQTT_PORT: 8883
-      MQTT_CERT: /tmp/mosquitto.org.crt
+      MQTT_CERT: /tmp/broker.emqx.io-ca.crt
       MQTT_TOPIC_CMD: from_cloud/commands
       MQTT_TOPIC_EVENT: from_device/events
       LOG_PATH: /var/log/gateway-py/gateway.log
       QR_API_BASE_URL: http://qr-c:8080
-    command: >
-      sh -lc '
-        echo "[gateway-py] up (placeholder) MQTT_HOST=$MQTT_HOST" &&
-        mkdir -p /var/log/gateway-py &&
-        touch "$LOG_PATH" &&
-        sleep infinity
-      '
+      QR_START_TIMEOUT_MS: 1000
+      POLL_INTERVAL_SEC: 0.3
+      POLL_MAX_SECONDS: 6.0
     volumes:
       - ./logs/gateway-py:/var/log/gateway-py
     depends_on:
       qr-c:
         condition: service_healthy
+    healthcheck:
+      # Simple check: process exists
+      test: ["CMD-SHELL", "python -c 'import os,signal; os.kill(1,0)'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  

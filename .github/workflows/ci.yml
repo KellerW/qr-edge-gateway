@@ -15,11 +15,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-format cmake ninja-build g++
 
-      - name: Configure
+      - name: Configure (for format target)
         run: cmake -S qr-c/src -B build -G Ninja
 
-      - name: Format check
-        run: cmake --build build --target format-check
+      - name: Run clang-format (and fail if changes)
+        run: |
+          cmake --build build --target format
+          git diff --exit-code
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Configure
+        run: |
+          cmake -S qr-c/src -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_UNIT_TEST=ON
+
+      - name: Build
+        run: cmake --build build -j 2
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
 
   integration:
     runs-on: ubuntu-latest
@@ -35,7 +59,9 @@ jobs:
         run: docker compose build
 
       - name: Run integration tests (api-test)
-        run: docker compose up --abort-on-container-exit --exit-code-from api-test api-test
+        run: |
+          docker compose --profile test up --build \
+            --abort-on-container-exit --exit-code-from api-test api-test
 
       - name: Collect compose logs
         if: always()
@@ -61,8 +87,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run contract tests (profile test)
-        run: docker compose --profile test up --build --abort-on-container-exit --exit-code-from contract-test contract-test
+      - name: Docker versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run contract tests (Schemathesis)
+        run: |
+          docker compose --profile test up --build \
+            --abort-on-container-exit --exit-code-from contract-test contract-test
 
       - name: Collect compose logs
         if: always()
