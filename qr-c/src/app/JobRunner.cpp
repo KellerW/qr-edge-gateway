@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: CC-BY-NC-4.0 */
 #include "JobRunner.hpp"
 
 #include <chrono>

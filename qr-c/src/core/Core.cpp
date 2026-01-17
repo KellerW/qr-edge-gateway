@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: CC-BY-NC-4.0 */
 /**
  * @file Core.cpp
  * @brief Implementation of core::Core command handling and guarded state transitions.

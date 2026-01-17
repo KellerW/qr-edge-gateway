@@ -337,3 +337,11 @@ docker compose exec qr-c sh -lc 'ls -l /tmp/ttyS1 || true'
 
 - Ensure the mounted OpenAPI is up to date (`docs/openapi.yaml`)
 - See: `docs/CONTRACT_TESTING.md`
+
+## License
+
+Licensed under Creative Commons Attribution–NonCommercial 4.0 International (CC BY-NC 4.0).
+
+Non-commercial use is permitted with attribution. Commercial/professional use is not permitted without prior written permission.
+
+See `LICENSE`.

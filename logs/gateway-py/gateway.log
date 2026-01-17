@@ -1,0 +1,14 @@
+2026-01-17 03:00:16,828 INFO gateway-py starting
+2026-01-17 03:00:16,828 INFO MQTT_HOST=broker.emqx.io MQTT_PORT=8883 TOPIC_CMD=from_cloud/commands TOPIC_EVT=from_device/events
+2026-01-17 03:00:16,828 INFO QR_API_BASE_URL=http://qr-c:8080
+2026-01-17 03:00:18,003 INFO MQTT connected rc=Success
+2026-01-17 03:00:18,003 INFO MQTT subscribed to from_cloud/commands
+2026-01-17 03:17:38,167 INFO gateway-py starting
+2026-01-17 03:17:38,167 INFO MQTT_HOST=mqtt MQTT_PORT=1883 TOPIC_CMD=from_cloud/commands/wkeller TOPIC_EVT=from_device/events/wkeller
+2026-01-17 03:17:38,167 INFO QR_API_BASE_URL=http://qr-c:8080
+2026-01-17 15:34:22,483 INFO gateway-py starting
+2026-01-17 15:34:22,483 INFO MQTT_HOST=test.mosquitto.org MQTT_PORT=8883 TOPIC_CMD=from_cloud/commands TOPIC_EVT=from_device/events
+2026-01-17 15:34:22,483 INFO QR_API_BASE_URL=http://qr-c:8080
+2026-01-17 15:34:53,095 INFO gateway-py starting
+2026-01-17 15:34:53,095 INFO MQTT_HOST=test.mosquitto.org MQTT_PORT=8883 TOPIC_CMD=from_cloud/commands TOPIC_EVT=from_device/events
+2026-01-17 15:34:53,095 INFO QR_API_BASE_URL=http://qr-c:8080

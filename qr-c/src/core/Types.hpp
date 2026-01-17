@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: CC-BY-NC-4.0 */
 /**
  * @file Types.hpp
  * @brief Core domain types: state machine states and standardized command responses.

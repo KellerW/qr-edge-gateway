@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: CC-BY-NC-4.0 */
 /**
  * @file Core.hpp
  * @brief Declares core::Core, a minimal stateful command handler and job-start interface.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: CC-BY-NC-4.0 */
 /**
  * @file Dispatcher.hpp
  * @brief Single-worker task dispatcher that serializes access to core::Core.

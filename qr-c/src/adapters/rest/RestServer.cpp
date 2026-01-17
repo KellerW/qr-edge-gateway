@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: CC-BY-NC-4.0 */
 /**
  * @file RestServer.cpp
  * @brief REST API adapter implemented with Crow.
