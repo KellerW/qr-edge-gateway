@@ -34,7 +34,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <cstdint>
-#include <cstdlib>   // std::getenv
+#include <cstdlib> 
 #include <memory>
 #include <string>
 #include <vector>
@@ -66,14 +66,12 @@ static void init_logging(const Config& cfg)
 {
     std::vector<spdlog::sink_ptr> sinks;
 
-    // Always log to console (stdout/stderr). This is the recommended container pattern.
     sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
 
-    // Optional: also log to a rotating file if explicitly enabled.
     if (!cfg.log_file.empty())
     {
         sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            cfg.log_file, 5 * 1024 * 1024, 3)); // 5MB, keep 3 files
+            cfg.log_file, 5 * 1024 * 1024, 3));
     }
 
     auto logger = std::make_shared<spdlog::logger>("qr_c", sinks.begin(), sinks.end());
