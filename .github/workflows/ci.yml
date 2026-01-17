@@ -1,5 +1,4 @@
 name: CI
-
 on:
   push:
   pull_request:
@@ -13,7 +12,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format cmake ninja-build g++
+          sudo apt-get install -y clang-format cmake ninja-build g++ -no-install-recommends libasio-dev
 
       - name: Configure (for format target)
         run: cmake -S qr-c/src -B build -G Ninja
