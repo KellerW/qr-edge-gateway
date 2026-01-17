@@ -74,44 +74,18 @@ services:
         cmake --build /work/build -j\$(nproc) &&
         ctest --test-dir /work/build --output-on-failure
       "
-
-  mqtt:
-    image: eclipse-mosquitto:2
-    ports:
-      - "1883:1883"
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 1883"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   gateway-py:
     build:
       context: ./gateway-py
       dockerfile: Dockerfile
     environment:
-      # Use local broker by default (stable for CI)
-      MQTT_HOST: mqtt
-      MQTT_PORT: 1883
-      MQTT_TOPIC_CMD: from_cloud/commands/wkeller
-      MQTT_TOPIC_EVENT: from_device/events/wkeller
-
-      LOG_PATH: /var/log/gateway-py/gateway.log
+      MQTT_HOST: broker.hivemq.com
+      MQTT_PORT: 8883
+      MQTT_CERT: /etc/ssl/certs/ca-certificates.crt
+      MQTT_TOPIC_CMD: wkeller/from_cloud/commands
+      MQTT_TOPIC_EVENT: wkeller/from_device/events
       QR_API_BASE_URL: http://qr-c:8080
 
-      QR_START_TIMEOUT_MS: 1000
-      POLL_INTERVAL_SEC: 0.3
-      POLL_MAX_SECONDS: 6.0
-    volumes:
-      - ./logs/gateway-py:/var/log/gateway-py
-    depends_on:
-      qr-c:
-        condition: service_healthy
-      mqtt:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import os; os.kill(1,0)'"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
+ #     LOG_PATH: /var/log/gateway-py/gateway.log
+#volumes:
+#  - ./logs/gateway-py:/var/log/gateway-py
