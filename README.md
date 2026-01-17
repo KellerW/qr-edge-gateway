@@ -8,9 +8,12 @@ It is built to be:
 - **Deterministic** (single-threaded Core execution via a Dispatcher)
 - **Testable** (pytest black-box tests + OpenAPI contract tests via Schemathesis)
 
+Optionally, it can be driven via an **MQTT gateway** (Container B) that bridges **cloud commands → REST** and publishes **device events → cloud**.
+
 ## Contents
 
 - [Quick Start](#quick-start)
+- [MQTT Gateway](#mqtt-gateway)
 - [What runs where](#what-runs-where)
 - [API](#api)
 - [Testing](#testing)
@@ -22,7 +25,7 @@ It is built to be:
 
 ## Quick Start
 
-Start the core services:
+### Start the core services (Serial emulation + REST API)
 
 ```bash
 docker compose up -d --build fake-serial qr-c
@@ -61,6 +64,99 @@ Stop (cancel + stop core):
 curl -s -X POST http://127.0.0.1:8080/stop
 ```
 
+### Start the full end-to-end stack (includes MQTT gateway)
+
+This starts **fake-serial + qr-c + gateway-py**:
+
+```bash
+docker compose up -d --build fake-serial qr-c gateway-py
+```
+
+Then run the MQTT commands shown in the next section.
+
+---
+
+## MQTT Gateway
+`gateway-py` subscribes to a **cloud command** topic and publishes **device events** back to the broker.
+
+### Recommended broker configuration
+
+Use a TLS-capable public broker with a certificate chain anchored in the system trust store.
+
+Example (HiveMQ public broker):
+
+- `MQTT_HOST=broker.hivemq.com`
+- `MQTT_PORT=8883`
+- `MQTT_CERT=/etc/ssl/certs/ca-certificates.crt`
+
+### Recommended topic namespace
+
+Public brokers are shared. Use namespaced topics to avoid collisions:
+
+- `MQTT_TOPIC_CMD=wkeller/from_cloud/commands`
+- `MQTT_TOPIC_EVENT=wkeller/from_device/events`
+
+### Basic MQTT commands (host-side)
+
+Open a subscriber (Terminal A):
+
+```bash
+mosquitto_sub -h broker.hivemq.com -p 8883 \
+  --cafile /etc/ssl/certs/ca-certificates.crt \
+  -t 'wkeller/from_device/events' -q 1 -v
+```
+
+Publish a command (Terminal B):
+
+```bash
+mosquitto_pub -h broker.hivemq.com -p 8883 \
+  --cafile /etc/ssl/certs/ca-certificates.crt \
+  -t 'wkeller/from_cloud/commands' -q 1 \
+  -m '{"type":"command","id":"demo-1","command":"PING"}'
+```
+
+Expected result on the subscriber:
+
+- An event JSON with `type=command_ack` and `message="PONG"`.
+
+### Supported gateway message patterns
+
+The gateway accepts either:
+
+- `{"type":"command","id":"...","command":"PING"}`
+- `{"type":"start","id":"...","timeout_ms":1000}`
+- `{"type":"stop","id":"..."}`
+
+Or, equivalently, command-style:
+
+- `{"type":"command","command":"START","timeout_ms":1000}`
+- `{"type":"command","command":"STOP"}`
+
+### START / STOP demo
+
+START:
+
+```bash
+mosquitto_pub -h broker.hivemq.com -p 8883 \
+  --cafile /etc/ssl/certs/ca-certificates.crt \
+  -t 'wkeller/from_cloud/commands' -q 1 \
+  -m '{"type":"command","id":"demo-2","command":"START","timeout_ms":1000}'
+```
+
+Expected events:
+
+- `job_accepted` (HTTP 202 from `/start`) with `jobId`
+- `job_result` when the job ends (`DONE|TIMEOUT|CANCELLED`)
+
+STOP:
+
+```bash
+mosquitto_pub -h broker.hivemq.com -p 8883 \
+  --cafile /etc/ssl/certs/ca-certificates.crt \
+  -t 'wkeller/from_cloud/commands' -q 1 \
+  -m '{"type":"command","id":"demo-3","command":"STOP"}'
+```
+
 ---
 
 ## What runs where
@@ -74,6 +170,11 @@ curl -s -X POST http://127.0.0.1:8080/stop
     - Core (state machine)
     - Dispatcher (single worker thread)
     - JobRunner + JobStore (async job + polling)
+- **gateway-py** (Container B):
+  - connects to an MQTT broker over TLS
+  - subscribes to `MQTT_TOPIC_CMD` (cloud commands)
+  - calls the qr-c REST API (`QR_API_BASE_URL`) to execute commands
+  - publishes acknowledgements/results to `MQTT_TOPIC_EVENT`
 
 Key constraint: **do not share PTYs across containers**. PTYs live in `/dev/pts` and are namespaced per container; a `/tmp/ttyS1` link created in one container is not usable in another.
 
@@ -195,7 +296,19 @@ Minimal documentation set under `docs/`:
 
 ## Troubleshooting
 
+### MQTT: no events appear
+
+- Check that `gateway-py` is connected and subscribed:
+
+```bash
+docker compose logs -f gateway-py
+```
+
+- Confirm topics match on both sides (publisher/subscriber and container env vars).
+- Prefer namespaced topics on public brokers (e.g., `wkeller/...`).
+
 ### `/start` returns `ERR:NOT_INIT`
+
 Run INIT first:
 
 ```bash
@@ -205,6 +318,7 @@ curl -s -X POST http://127.0.0.1:8080/command \
 ```
 
 ### Job times out (TIMEOUT)
+
 - Check logs:
 
 ```bash
@@ -220,5 +334,6 @@ docker compose exec qr-c sh -lc 'ls -l /tmp/ttyS1 || true'
 ```
 
 ### Contract test failures
+
 - Ensure the mounted OpenAPI is up to date (`docs/openapi.yaml`)
 - See: `docs/CONTRACT_TESTING.md`
