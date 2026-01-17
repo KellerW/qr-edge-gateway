@@ -356,82 +356,37 @@ docker compose --profile test run --rm contract-test sh -lc 'ls -l /spec && head
 
 ## Diagrams
 
-The repository ships PlantUML sources under `Diagrams/`. They are intentionally kept as text so they can be rendered in CI or locally.
+GitHub does not render PlantUML sources by default. To make diagrams visible in the repository UI, this project keeps:
 
-Included diagrams:
+- **PlantUML sources** under `Diagrams/` (authoritative)
+- **Rendered SVGs** under `Diagrams/out/` (checked into git)
 
-- `Diagrams/architecture.plantuml` — original high-level context (Cloud MQTT ↔ Gateway ↔ QR adapter ↔ Serial device).
-- `Diagrams/architecture_overview_v2.plantuml` — updated overview including the dev `fake-serial` path and the REST endpoints.
-- `Diagrams/serial_emulation_dataflow.plantuml` — why PTY must be created in the consumer container (TCP → socat → local PTY).
-- `Diagrams/rest_job_sequence.plantuml` — REST sequence (INIT → START → RESULT polling → STOP).
-- `Diagrams/core_state_machine.plantuml` — Core state machine.
-
-### Rendering (recommended)
+### Render diagrams to SVG
 
 Using Docker (no local install required):
 
 ```bash
-# Render all PlantUML files to SVG under ./Diagrams/out
 mkdir -p Diagrams/out
 docker run --rm -v "$PWD/Diagrams:/work" plantuml/plantuml:latest   -tsvg -o out /work/*.plantuml
 ```
 
-You can then reference `Diagrams/out/*.svg` from this README.
+Commit the generated `Diagrams/out/*.svg` files.
 
-### Mermaid alternatives
+### Preview
 
-GitHub renders Mermaid blocks directly, so the README also contains Mermaid diagrams for quick viewing.
+Architecture overview:
 
+![Architecture overview](diagrams/out/architecture_overview_v2.svg)
 
-### Quick-view diagrams (Mermaid)
+Serial emulation dataflow (DEV):
 
-#### Serial emulation dataflow (DEV)
+![Serial emulation dataflow](diagrams/out/serial_emulation_dataflow.svg)
 
-```mermaid
-flowchart LR
-  F[fake-serial\nTCP :7000\nCOBS frames] --> S[socat\nTCP -> PTY]
-  S --> P[PTY /tmp/ttyS1\n(local to qr-c)]
-  A[C++ app\nreads /tmp/ttyS1] --> P
-```
+REST job sequence:
 
-#### REST job flow
+![REST job sequence](diagrams/out/rest_job_sequence.svg)
 
-```mermaid
-sequenceDiagram
-  participant Client
-  participant REST as qr-c REST
-  participant Disp as Dispatcher
-  participant Core
-  participant JR as JobRunner
-  participant JS as JobStore
+Core state machine:
 
-  Client->>REST: POST /command (INIT)
-  REST->>Disp: submit_sync(INIT)
-  Disp->>Core: handle_sync_command(INIT)
-  Core-->>Disp: OK (INIT)
-  Disp-->>REST: Response
-  REST-->>Client: 200 OK
+![Core state machine](diagrams/out/core_state_machine.svg)
 
-  Client->>REST: POST /start {timeout_ms}
-  REST->>Disp: submit_start_job(timeout)
-  Disp->>Core: start_job(timeout)
-  Core-->>Disp: ACCEPTED (RUNNING)
-  Disp-->>REST: ok
-  REST->>JR: start(timeout) -> jobId
-  REST-->>Client: 202 Accepted (jobId)
-
-  loop Poll
-    Client->>REST: GET /result/{jobId}
-    REST->>JS: get(jobId)
-    JS-->>REST: PENDING/DONE/TIMEOUT/CANCELLED (+ data)
-    REST-->>Client: 200 status + data
-  end
-
-  Client->>REST: POST /stop
-  REST->>JR: stop()
-  REST->>Disp: submit_stop()
-  Disp->>Core: stop()
-  Core-->>Disp: STOPPED
-  Disp-->>REST: OK
-  REST-->>Client: 200 OK
-```
