@@ -1,0 +1,39 @@
+@startuml
+title Compose / Deployment View (DEV)
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultFontName "Arial"
+left to right direction
+
+node "Docker Host" as Host {
+  frame "docker compose project network" as Net {
+
+    rectangle "fake-serial\n(simulator)\nTCP :7000\nhealthcheck: nc -z :7000" as Fake
+
+    rectangle "qr-c\n(C++)\nREST :8080\nhealthcheck: GET /health\n\n- entrypoint starts socat\n- app reads PTY /tmp/ttyS1" as QRC
+
+    rectangle "api-test\n(pytest)\nprofile: test\ncalls qr-c REST" as APIT
+
+    rectangle "contract-test\n(schemathesis)\nprofile: test\nOpenAPI from ./docs\ncalls qr-c REST" as CT
+  }
+
+  folder "./docs\n(openapi.yaml)" as Docs
+  folder "./logs\n(optional)" as Logs
+}
+
+Fake --> QRC : TCP stream\nfake-serial:7000\n(COBS frames)
+APIT --> QRC : REST\nhttp://qr-c:8080
+CT --> QRC : REST\nhttp://qr-c:8080
+
+Docs ..> CT : volume mount\n/spec/openapi.yaml (ro)
+Logs ..> QRC : volume mount\n/var/log/qr-c (optional)
+
+note right of QRC
+Serial is emulated as:
+TCP -> socat -> local PTY
+
+PTY must be created in qr-c container.
+end note
+
+@enduml

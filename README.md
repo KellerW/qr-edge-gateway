@@ -4,29 +4,14 @@ This repository provides a **containerized fake QR reader** used to validate end
 
 It includes:
 
-- **fake-serial**: a TCP-based serial simulator that emits QR payload frames.
-- **qr-c**: a C++ service that bridges TCP → local PTY and exposes a REST API.
+- **fake-serial**: TCP-based simulator that emits QR payload frames.
+- **qr-c**: C++ service that bridges TCP → local PTY and exposes a REST API.
 - **api-test**: pytest-based black-box tests.
 - **contract-test**: Schemathesis-based OpenAPI contract testing.
 
----
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-- [API](#api)
-- [Configuration](#configuration)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Repository Layout](#repository-layout)
-- [Notes & Limitations](#notes--limitations)
-
----
-
 ## Quick Start
 
-### 1) Build and run the core services
+Build and run the core services:
 
 ```bash
 docker compose up -d --build fake-serial qr-c
@@ -39,23 +24,18 @@ curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/status
 ```
 
-Expected:
-
-- `/health` → `{"ok":true,"message":"UP"}`
-- `/status` → `{"ok":true,"state":"NOT_INIT"}` (initially)
-
-### 2) Initialize (INIT) and run a job
-
-INIT (Option B: baudrate via params):
+Initialize (INIT) and run a job:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"INIT","params":{"baudrate":115200}}'
-```
+# INIT (Option B: baudrate via params)
+curl -s -X POST http://127.0.0.1:8080/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"INIT","params":{"baudrate":115200}}'
 
-Start a job:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/start   -H 'Content-Type: application/json'   -d '{"timeout_ms":3000}'
+# START (JSON body required; at least {})
+curl -s -X POST http://127.0.0.1:8080/start \
+  -H 'Content-Type: application/json' \
+  -d '{"timeout_ms":3000}'
 ```
 
 Poll the result (replace `<jobId>`):
@@ -64,329 +44,139 @@ Poll the result (replace `<jobId>`):
 curl -s http://127.0.0.1:8080/result/<jobId>
 ```
 
-Stop (cancels an active wait and stops the core):
+Stop (cancels active waits and stops the core):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/stop
 ```
-
----
-
-## Architecture
-
-### Why PTY sharing across containers fails
-
-A common mistake is to create a PTY in one container and share the `/tmp/ttyS1` link via a volume.
-
-This fails because:
-
-- PTYs live under `/dev/pts/N` in `devpts`.
-- Each container has its own `devpts` namespace.
-- `link=/tmp/ttyS1` is only a symlink to a PTY that exists *inside the container that created it*.
-- Sharing `/tmp` shares the symlink text, not the PTY node.
-
-**Conclusion:** the PTY must be created in the same container where the application opens it.
-
-### Selected design
-
-- Transport between containers: **TCP**
-- Local serial endpoint for the app: **PTY inside `qr-c`**
-- Bridge: **socat** inside `qr-c`
-
-```mermaid
-flowchart LR
-  subgraph Fake["fake-serial container"]
-    F[TCP server :7000\nemits QR stream]
-  end
-
-  subgraph QRC["qr-c container"]
-    S[socat bridge\nTCP -> PTY]
-    P["PTY /tmp/ttyS1\n(local)"]
-    A["C++ app\nreads /tmp/ttyS1"]
-  end
-
-  F -- TCP:7000 --> S
-  S --> P
-  A --> P
-```
-
-### Domain execution model
-
-- REST requests (Crow) submit work to a **single-threaded Dispatcher**
-- Dispatcher serializes all calls into the Core (state machine)
-- `/start` triggers a job; the JobRunner reads serial data and writes results to JobStore
-- `/result/{id}` polls JobStore
-
-```mermaid
-flowchart TB
-  subgraph Adapters["Adapters"]
-    R[REST Adapter\n(Crow)]
-  end
-
-  D[Dispatcher\n(single worker thread)]
-  C[Core\nState machine]
-  JR[JobRunner\nserial read + timeout + reconnect]
-  JS[JobStore\nin-memory results]
-
-  R --> D
-  D --> C
-  JR --> JS
-  R --> JS
-```
-
----
 
 ## API
 
-The OpenAPI specification lives under:
+OpenAPI spec:
 
 - `docs/openapi.yaml`
 
-### Endpoints
+Endpoints:
 
-- `GET /health`  
-  Returns liveness: `{ ok, message }`
+- `GET /health` → `{ ok, message }`
+- `GET /status` → `{ ok, state }`
+- `POST /command` → sync commands (`PING`, `INIT`, `STOP`)
+- `POST /start` → async job start (JSON body required)
+- `GET /result/{id}` → `PENDING | DONE | TIMEOUT | CANCELLED`
+- `POST /stop` → cancels active wait + stops core
 
-- `GET /status`  
-  Returns Core state: `{ ok, state }`  
-  States: `NOT_INIT | INIT | RUNNING | STOPPED`
+## Configuration (key env vars)
 
-- `POST /command`  
-  Executes synchronous commands (`PING`, `INIT`, `STOP`).  
-  Body:
-  ```json
-  {"command":"PING","params":{}}
-  ```
-  Notes:
-  - `params` must be an object if present (never `null`).
-  - `INIT` supports Option B: `params.baudrate` or top-level `baudrate`.
-
-- `POST /start`  
-  Starts an async QR read job. **JSON body required** (at least `{}`).
-  ```json
-  {"timeout_ms":3000}
-  ```
-  Returns `202` with `jobId`. Poll `/result/{id}`.
-
-- `GET /result/{id}`  
-  Returns job status and payload:
-  - `status: PENDING | DONE | TIMEOUT | CANCELLED`
-  - on `DONE`, `data.qr` is present
-
-- `POST /stop`  
-  Cancels an active wait/job and transitions Core to `STOPPED`.
-
-### Examples
-
-PING:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"PING"}'
-```
-
-INIT with baudrate:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"INIT","params":{"baudrate":115200}}'
-```
-
-START:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/start   -H 'Content-Type: application/json'   -d '{"timeout_ms":3000}'
-```
-
-POLL:
-
-```bash
-curl -s http://127.0.0.1:8080/result/<jobId>
-```
-
-STOP:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/stop
-```
-
----
-
-## Configuration
-
-### Key environment variables
-
-#### `qr-c`
-- `SERIAL_PORT=/tmp/ttyS1`  
-  Local PTY path opened by the C++ app.
-
-- `FAKE_SERIAL_HOST=fake-serial`  
-  Docker service name for the TCP serial simulator.
-
-- `FAKE_SERIAL_PORT=7000`  
-  TCP port exposed by fake-serial.
-
+### qr-c
+- `SERIAL_PORT=/tmp/ttyS1`
+- `FAKE_SERIAL_HOST=fake-serial`
+- `FAKE_SERIAL_PORT=7000`
 - `REST_BIND=0.0.0.0`
 - `REST_PORT=8080`
 - `READ_TIMEOUT_MS=3000`
-- `REOPEN_DELAY_MS=1000`  
-  Retry delay when opening the PTY fails (serial reopen behavior).
+- `REOPEN_DELAY_MS=1000`
 
-#### `fake-serial`
+### fake-serial
 - `FAKE_SERIAL_PORT=7000`
 - `PARCEL_PAYLOAD="QR:123456"`
 - `PARCEL_INTERVAL_MS=2000`
 
-### Bridge command (reference)
-
-Inside `qr-c` (typically via `entrypoint.sh`):
-
-```sh
-socat -d -d pty,raw,echo=0,link=/tmp/ttyS1 tcp:fake-serial:7000 &
-```
-
----
-
 ## Testing
 
-### 1) API tests (pytest)
-
-Runs black-box tests against the running service:
+### API tests (pytest)
 
 ```bash
 docker compose --profile test run --rm --build api-test
 ```
 
-Expected: `N passed`.
-
-### 2) Contract tests (Schemathesis)
-
-Uses OpenAPI schema to generate tests:
+### Contract tests (Schemathesis)
 
 ```bash
 docker compose --profile test run --rm --build contract-test
 ```
 
 Notes:
-- The contract-test container performs an `INIT` step before running Schemathesis.
-- The Schemathesis run excludes the `unsupported_method` check (Crow does not set `Allow` header on 405 for TRACE).
+- Contract tests run an INIT pre-step.
+- Schemathesis excludes the `unsupported_method` check (Crow 405 does not include RFC-required `Allow` header for TRACE).
 
-### 3) Run both (api-test + contract-test)
+## Diagrams (PlantUML → SVG)
+
+The authoritative diagram sources are PlantUML files under `diagrams/`.
+
+GitHub does not render PlantUML sources directly, therefore we **render SVGs** and keep them under `diagrams/out/` so they are visible in the repository UI and inside this README.
+
+### Render to SVG (recommended)
+
+Using Docker (no local install required):
 
 ```bash
-docker compose --profile test up --build --abort-on-container-exit api-test contract-test
+mkdir -p diagrams/out
+docker run --rm -v "$PWD/diagrams:/work" plantuml/plantuml:latest \
+  -tsvg -o out /work/*.plantuml
 ```
 
----
+Or use the helper script:
 
-## Troubleshooting
+```bash
+./render_diagrams.sh
+```
+
+### Embedded diagrams (SVG)
+
+> These images will appear after you render and commit `diagrams/out/*.svg`.
+
+#### Architecture overview
+
+![Architecture overview](diagrams/out/architecture_overview_v2.svg)
+
+#### Serial emulation dataflow (DEV)
+
+![Serial emulation dataflow](diagrams/out/serial_emulation_dataflow.svg)
+
+#### REST job sequence
+
+![REST job sequence](diagrams/out/rest_job_sequence.svg)
+
+#### Core state machine
+
+![Core state machine](diagrams/out/core_state_machine.svg)
+
+#### Compose deployment view
+
+![Compose deployment](diagrams/out/compose_deployment.svg)
+
+#### Testing pipeline (profiles)
+
+![Testing pipeline](diagrams/out/testing_pipeline.svg)
+
+## Troubleshooting (common)
 
 ### `/start` returns `ERR:NOT_INIT`
 Run INIT first:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/command   -H 'Content-Type: application/json'   -d '{"command":"INIT"}'
+curl -s -X POST http://127.0.0.1:8080/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"INIT"}'
 ```
 
-### Job never completes (TIMEOUT)
+### Job times out (TIMEOUT)
 - Check logs:
 ```bash
 docker compose logs -f fake-serial
 docker compose logs -f qr-c
 ```
-- Increase `timeout_ms` in `/start`.
-- Ensure the PTY exists inside `qr-c`:
+- Increase `timeout_ms` in `/start`
+- Ensure `/tmp/ttyS1` exists inside `qr-c`:
 ```bash
 docker compose exec qr-c sh -lc 'ls -l /tmp/ttyS1 || true'
 ```
 
-### STOP cancels but job becomes DONE anyway
-This can happen if the fake-serial payload arrives before STOP is processed. For deterministic tests:
-- increase `PARCEL_INTERVAL_MS` during testing (e.g., 10000ms),
-- or call STOP immediately after START.
+## Documentation set (recommended)
 
-### Contract-test fails due to spec mismatch
-- Confirm the mounted spec:
-```bash
-docker compose --profile test run --rm contract-test sh -lc 'ls -l /spec && head -n 20 /spec/openapi.yaml'
-```
-- Ensure `docs/openapi.yaml` matches the implementation (CANCELLED, /stop, /start body required).
+If you want a minimal, clean docs set under `docs/`:
 
----
-
-## Repository Layout
-
-```text
-.
-├── docs/
-│   └── openapi.yaml
-├── fake_serial/
-│   ├── Dockerfile
-│   └── fake_serial.c
-├── qr-c/
-│   ├── Dockerfile
-│   └── src/
-│       ├── main.cpp
-│       ├── adapters/rest/RestServer.(hpp|cpp)
-│       ├── app/(Dispatcher|JobRunner|JobStore).(hpp|cpp)
-│       └── core/(Core|Types).(hpp|cpp)
-├── tests/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── test_api.py
-└── tests/contract/
-    └── Dockerfile
-```
-
----
-
-## Notes & Limitations
-
-- **PTY is local to `qr-c`** by design (not shareable across containers).
-- **JobStore is in-memory** (results are not persisted).
-- **Single-job policy** (current JobRunner runs one job at a time).
-- Serial emulation is a **byte-stream approximation** (not a perfect USB serial replica).
-
----
-
-## More documentation
-
-- `docs/serial-emulation-and-dispatcher.md` (recommended)  
-  Design rationale, diagrams, constraints, and extension points.
-
----
-
-## Diagrams
-
-GitHub does not render PlantUML sources by default. To make diagrams visible in the repository UI, this project keeps:
-
-- **PlantUML sources** under `Diagrams/` (authoritative)
-- **Rendered SVGs** under `Diagrams/out/` (checked into git)
-
-### Render diagrams to SVG
-
-Using Docker (no local install required):
-
-```bash
-mkdir -p Diagrams/out
-docker run --rm -v "$PWD/Diagrams:/work" plantuml/plantuml:latest   -tsvg -o out /work/*.plantuml
-```
-
-Commit the generated `Diagrams/out/*.svg` files.
-
-### Preview
-
-Architecture overview:
-
-![Architecture overview](diagrams/out/architecture_overview_v2.svg)
-
-Serial emulation dataflow (DEV):
-
-![Serial emulation dataflow](diagrams/out/serial_emulation_dataflow.svg)
-
-REST job sequence:
-
-![REST job sequence](diagrams/out/rest_job_sequence.svg)
-
-Core state machine:
-
-![Core state machine](diagrams/out/core_state_machine.svg)
-
+- `docs/ARCHITECTURE.md` — rationale (PTY namespaces, dispatcher model).
+- `docs/PROTOCOL.md` — framing (COBS + 0x00), payload expectations (`QR:...`), limits.
+- `docs/OPERATIONS.md` — common curl flows, env vars, logs.
+- `docs/CONTRACT_TESTING.md` — Schemathesis notes and OpenAPI maintenance.

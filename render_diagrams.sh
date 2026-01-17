@@ -3,7 +3,7 @@ set -eu
 
 mkdir -p diagrams/out
 
-# Render all PlantUML files in Diagrams/ to SVG in Diagrams/out/
+# Render all PlantUML files in diagrams/ to SVG in diagrams/out/
 docker run --rm -v "$PWD/diagrams:/work" plantuml/plantuml:latest \
   -tsvg -o out /work/*.plantuml
 

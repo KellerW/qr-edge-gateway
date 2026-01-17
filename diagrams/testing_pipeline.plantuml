@@ -1,0 +1,28 @@
+@startuml
+title Test Pipeline (Profiles)
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultFontName "Arial"
+top to bottom direction
+
+rectangle "docker compose up -d\nfake-serial + qr-c" as Up
+rectangle "Healthchecks\n(fake-serial: nc)\n(qr-c: GET /health)" as HC
+rectangle "api-test (pytest)\nblack-box assertions" as APIT
+rectangle "contract-test (schemathesis)\nOpenAPI contract\n(exclude unsupported_method)" as CT
+rectangle "Result: exit code 0" as OK
+
+Up --> HC
+HC --> APIT : profile=test
+HC --> CT : profile=test
+APIT --> OK
+CT --> OK
+
+note right of CT
+Schemathesis runs:
+- INIT pre-step
+- checks all
+- excludes: unsupported_method
+end note
+
+@enduml
